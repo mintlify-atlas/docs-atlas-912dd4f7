@@ -1,0 +1,340 @@
+---
+title: Diagnostics
+description: Error reporting and accumulation using codespan-reporting
+---
+
+MCC uses Salsa's accumulator pattern to collect diagnostics (errors, warnings, notes) during compilation. Diagnostics are structured using the [codespan-reporting](https://docs.rs/codespan-reporting) library.
+
+## Diagnostics Type
+
+```rust
+#[repr(transparent)]
+#[salsa::accumulator]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Diagnostics(pub Diagnostic);
+```
+
+The `Diagnostics` newtype wraps `codespan_reporting::diagnostic::Diagnostic` and is registered as a Salsa accumulator.
+
+### Diagnostic Type Alias
+
+```rust
+pub type Diagnostic = codespan_reporting::diagnostic::Diagnostic<SourceFile>;
+```
+
+The underlying diagnostic type uses `SourceFile` as the file ID.
+
+## Accumulation Pattern
+
+Instead of returning `Result<T, E>` and short-circuiting on errors, MCC stages accumulate diagnostics and continue processing when possible.
+
+### Emitting Diagnostics
+
+Within a tracked Salsa function, emit diagnostics using the `accumulate` method:
+
+```rust
+use mcc::diagnostics::{Diagnostic, DiagnosticExt};
+use codespan_reporting::diagnostic::{Diagnostic as CSDiagnostic, Label, Severity};
+
+// Inside a tracked function with access to `db`
+let diag = CSDiagnostic::new(Severity::Error)
+    .with_message("undefined variable")
+    .with_labels(vec![
+        Label::primary(source_file, span)
+            .with_message("not found in this scope")
+    ]);
+
+diag.accumulate(db);
+```
+
+### Retrieving Diagnostics
+
+After calling a pipeline stage, retrieve accumulated diagnostics:
+
+```rust
+use mcc::{Database, SourceFile, Text, diagnostics::Diagnostics};
+
+let db = Database::default();
+let file = SourceFile::new(&db, "test.c".into(), "int main() {}".into());
+
+// Run the parse stage
+let ast = mcc::parse(&db, file);
+
+// Retrieve diagnostics emitted during parsing
+let diags: Vec<&Diagnostics> = mcc::parse::accumulated::<Diagnostics>(&db, file);
+```
+
+Each stage exposes an `accumulated` method:
+
+- `mcc::parse::accumulated::<Diagnostics>(&db, file)`
+- `mcc::lowering::lower_stage_diagnostics(&db, file)` (convenience wrapper)
+- `mcc::codegen::generate_assembly::accumulated::<Diagnostics>(&db, tacky)`
+- `mcc::render_program::accumulated::<Diagnostics>(&db, program, target)`
+
+## DiagnosticExt Trait
+
+```rust
+pub trait DiagnosticExt {
+    fn accumulate(self, db: &dyn crate::Db);
+}
+
+impl DiagnosticExt for Diagnostic {
+    fn accumulate(self, db: &dyn crate::Db) {
+        Diagnostics(self).accumulate(db);
+    }
+}
+```
+
+This extension trait provides a convenient `accumulate` method on `Diagnostic` that wraps it in `Diagnostics` and accumulates it.
+
+## Rendering Diagnostics
+
+Use `codespan-reporting` to render diagnostics to a terminal or file:
+
+```rust
+use mcc::{Database, SourceFile, Text, Files, diagnostics::Diagnostics};
+use codespan_reporting::term;
+use codespan_reporting::term::termcolor::{ColorChoice, StandardStream};
+
+let db = Database::default();
+let file = SourceFile::new(&db, "test.c".into(), "int main() {}".into());
+
+// Run compilation
+let _ = mcc::parse(&db, file);
+let diags: Vec<&Diagnostics> = mcc::parse::accumulated::<Diagnostics>(&db, file);
+
+// Set up rendering
+let mut files = Files::new();
+files.add(&db, file);
+
+let writer = StandardStream::stderr(ColorChoice::Auto);
+let config = term::Config::default();
+
+// Render each diagnostic
+for diag in diags {
+    term::emit(&mut writer.lock(), &config, &files, &**diag).unwrap();
+}
+```
+
+### Files Type
+
+```rust
+pub struct Files(Vec<FileEntry>);
+
+impl Files {
+    pub const fn new() -> Self;
+    pub fn add(&mut self, db: &dyn Db, file: SourceFile);
+}
+```
+
+The `Files` type implements `codespan_reporting::files::Files` and maps `SourceFile` IDs to their contents for rendering.
+
+## Diagnostic Structure
+
+Diagnostics consist of:
+
+- **Severity**: `Error`, `Warning`, `Note`, `Help`, or `Bug`
+- **Code**: Optional error code (e.g., `E0001`)
+- **Message**: Primary message
+- **Labels**: Source locations with annotations
+- **Notes**: Additional free-form text
+
+### Example: Creating a Diagnostic
+
+```rust
+use codespan_reporting::diagnostic::{Diagnostic, Label, Severity};
+use mcc::SourceFile;
+
+let diag = Diagnostic::error()
+    .with_message("type mismatch")
+    .with_code("E0308")
+    .with_labels(vec![
+        Label::primary(file, 10..15)
+            .with_message("expected `int`, found `char`"),
+    ])
+    .with_notes(vec![
+        "consider casting the value".to_string(),
+    ]);
+```
+
+## Accumulator Internals
+
+The `#[salsa::accumulator]` attribute generates infrastructure to collect values during query execution:
+
+```rust
+#[salsa::accumulator]
+pub struct Diagnostics(pub Diagnostic);
+```
+
+When you call `.accumulate(db)`, Salsa stores the diagnostic in a thread-local accumulator. After the query completes, you retrieve all accumulated values with `stage::accumulated::<Diagnostics>(&db, ...)`.
+
+### Deref Implementation
+
+```rust
+impl Deref for Diagnostics {
+    type Target = Diagnostic;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+```
+
+The `Deref` implementation allows treating `&Diagnostics` as `&Diagnostic`:
+
+```rust
+let diags: Vec<&Diagnostics> = /* ... */;
+for diag in diags {
+    println!("{}", diag.message); // Access Diagnostic fields directly
+}
+```
+
+## Multi-Stage Diagnostics
+
+Collect diagnostics from multiple stages:
+
+```rust
+use mcc::{Database, SourceFile, Text, diagnostics::Diagnostics};
+
+let db = Database::default();
+let file = SourceFile::new(&db, "main.c".into(), source_code.into());
+
+// Parse
+let ast = mcc::parse(&db, file);
+let parse_diags = mcc::parse::accumulated::<Diagnostics>(&db, file);
+
+// Lower
+let tacky = mcc::lowering::lower_program(&db, file);
+let lower_diags = mcc::lowering::lower_stage_diagnostics(&db, file);
+
+// Codegen
+let asm = mcc::codegen::generate_assembly(&db, tacky);
+let codegen_diags = mcc::codegen::generate_assembly::accumulated::<Diagnostics>(&db, tacky);
+
+// Combine all diagnostics
+let all_diags: Vec<&Diagnostics> = parse_diags
+    .into_iter()
+    .chain(lower_diags.into_iter())
+    .chain(codegen_diags.into_iter())
+    .collect();
+```
+
+## Error Codes
+
+MCC defines error codes in the `codes` module:
+
+```rust
+pub mod codes {
+    // Parse errors
+    pub const E0001: &str = "E0001"; // Syntax error
+    // Type errors
+    pub const E0308: &str = "E0308"; // Type mismatch
+    // ... more codes
+}
+```
+
+Use these constants when creating diagnostics:
+
+```rust
+use mcc::codes;
+
+let diag = Diagnostic::error()
+    .with_code(codes::E0308)
+    .with_message("type mismatch");
+```
+
+## Example: Complete Error Flow
+
+```rust
+use mcc::{
+    Database, SourceFile, Text, Files,
+    diagnostics::{Diagnostic, DiagnosticExt, Diagnostics},
+};
+use codespan_reporting::diagnostic::{Diagnostic as CSDiagnostic, Label, Severity};
+use codespan_reporting::term;
+use codespan_reporting::term::termcolor::{ColorChoice, StandardStream};
+
+let db = Database::default();
+let src = "int main() { return x; }";
+let file = SourceFile::new(&db, "main.c".into(), src.into());
+
+// Compile and collect diagnostics
+let _ = mcc::parse(&db, file);
+let diags: Vec<&Diagnostics> = mcc::parse::accumulated::<Diagnostics>(&db, file);
+
+if !diags.is_empty() {
+    // Render diagnostics to stderr
+    let mut files = Files::new();
+    files.add(&db, file);
+
+    let writer = StandardStream::stderr(ColorChoice::Auto);
+    let config = term::Config::default();
+
+    for diag in diags {
+        term::emit(&mut writer.lock(), &config, &files, &**diag).unwrap();
+    }
+
+    // Exit with error code
+    std::process::exit(1);
+}
+```
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Don't panic on errors">
+    Use the accumulator pattern instead of panicking or returning `Result`. This allows collecting multiple errors in a single pass.
+    
+    ```rust
+    // Bad
+    if error { panic!("error"); }
+    
+    // Good
+    if error {
+        Diagnostic::error().with_message("error").accumulate(db);
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="Provide helpful labels">
+    Use `Label::primary` for the main error location and `Label::secondary` for related context:
+    
+    ```rust
+    Diagnostic::error()
+        .with_message("variable not found")
+        .with_labels(vec![
+            Label::primary(file, use_span).with_message("used here"),
+            Label::secondary(file, decl_span).with_message("similar name declared here"),
+        ])
+    ```
+  </Accordion>
+
+  <Accordion title="Add notes for guidance">
+    Include actionable suggestions in notes:
+    
+    ```rust
+    Diagnostic::error()
+        .with_message("type mismatch")
+        .with_notes(vec![
+            "help: consider using a cast: `(int) value`".to_string(),
+        ])
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="API Overview" icon="book" href="/api/overview">
+    See how diagnostics fit into the overall API
+  </Card>
+  <Card title="Database" icon="database" href="/api/database">
+    Learn about Salsa accumulators
+  </Card>
+  <Card title="Callbacks" icon="webhook" href="/api/callbacks">
+    Handle diagnostics in the driver callbacks
+  </Card>
+  <Card title="codespan-reporting" icon="arrow-up-right-from-square" href="https://docs.rs/codespan-reporting">
+    External documentation for diagnostic rendering
+  </Card>
+</CardGroup>

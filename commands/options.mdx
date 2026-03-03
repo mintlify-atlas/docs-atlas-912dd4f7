@@ -1,0 +1,348 @@
+---
+title: "Command-Line Options"
+description: "Complete reference for all MCC compiler flags and options"
+---
+
+## Synopsis
+
+```bash
+mcc [OPTIONS] <INPUT>
+```
+
+## Required Arguments
+
+<ParamField path="INPUT" type="path" required>
+  Path to the C source file to compile.
+  
+  **Example:**
+  ```bash
+  mcc main.c
+  ```
+</ParamField>
+
+## Output Options
+
+<ParamField path="--output" type="path">
+  Specify the output file path for the compiled executable.
+  
+  **Short form:** `-o`
+  
+  **Default:** Input filename without extension
+  
+  **Examples:**
+  ```bash
+  mcc -o myprogram main.c
+  mcc --output bin/server server.c
+  ```
+</ParamField>
+
+<ParamField path="-S" type="flag">
+  Generate and keep the assembly file after compilation.
+  
+  When specified:
+  - Assembly file is saved with `.s` extension
+  - Executable is still produced
+  - Assembly file persists after linking
+  
+  **Output file naming:**
+  - If `-o program` is specified: `program.s`
+  - If no `-o` flag: `input.s` (based on input filename)
+  
+  **Examples:**
+  ```bash
+  # Creates hello and hello.s
+  mcc -S hello.c
+  
+  # Creates myapp and myapp.s
+  mcc -S -o myapp hello.c
+  ```
+</ParamField>
+
+## Stage Control Options
+
+Stop compilation at a specific stage. These flags are mutually exclusive.
+
+<ParamField path="--lex" type="flag">
+  Stop after lexing (tokenization).
+  
+  **Pipeline stages executed:**
+  1. Preprocessing
+  2. Lexing ← stops here
+  
+  **Use case:** Debug tokenization issues
+  
+  **Example:**
+  ```bash
+  mcc --lex input.c
+  ```
+</ParamField>
+
+<ParamField path="--parse" type="flag">
+  Stop after parsing.
+  
+  **Pipeline stages executed:**
+  1. Preprocessing
+  2. Lexing
+  3. Parsing ← stops here
+  
+  **Use case:** Debug syntax and parser issues
+  
+  **Example:**
+  ```bash
+  mcc --parse input.c
+  ```
+</ParamField>
+
+<ParamField path="--tacky" type="flag">
+  Stop after lowering to Three Address Code (TACKY) intermediate representation.
+  
+  **Pipeline stages executed:**
+  1. Preprocessing
+  2. Lexing
+  3. Parsing
+  4. Type checking
+  5. Lowering to TACKY ← stops here
+  
+  **Use case:** Debug semantic analysis and IR generation
+  
+  **Example:**
+  ```bash
+  mcc --tacky input.c
+  ```
+</ParamField>
+
+<ParamField path="--codegen" type="flag">
+  Stop after code generation (assembly IR creation).
+  
+  **Pipeline stages executed:**
+  1. Preprocessing
+  2. Lexing
+  3. Parsing
+  4. Type checking
+  5. Lowering to TACKY
+  6. Code generation ← stops here
+  
+  **Use case:** Debug assembly instruction generation
+  
+  **Example:**
+  ```bash
+  mcc --codegen input.c
+  ```
+</ParamField>
+
+## Target Options
+
+<ParamField path="--target" type="triple">
+  Specify the target architecture triple for cross-compilation.
+  
+  **Default:** Host system's default target
+  
+  **Format:** `<arch>-<vendor>-<os>-<abi>`
+  
+  **Common targets:**
+  - `x86_64-unknown-linux-gnu` - 64-bit Linux (GNU)
+  - `x86_64-unknown-linux-musl` - 64-bit Linux (musl)
+  - `x86_64-apple-darwin` - macOS
+  - `aarch64-unknown-linux-gnu` - ARM64 Linux
+  
+  **Examples:**
+  ```bash
+  # Cross-compile for Linux
+  mcc --target x86_64-unknown-linux-gnu main.c
+  
+  # Compile for ARM64
+  mcc --target aarch64-unknown-linux-gnu main.c
+  ```
+</ParamField>
+
+## Display Options
+
+<ParamField path="--color" type="choice">
+  Control colored output for diagnostics and error messages.
+  
+  **Choices:**
+  - `auto` - Enable colors if outputting to a terminal (default)
+  - `always` - Always use colors
+  - `never` - Never use colors
+  
+  **Default:** `auto`
+  
+  **Examples:**
+  ```bash
+  # Force colors (useful for piping with 'less -R')
+  mcc --color always main.c 2>&1 | less -R
+  
+  # Disable colors (useful for CI/CD)
+  mcc --color never main.c
+  ```
+</ParamField>
+
+## Environment Variables
+
+The compiler respects the following environment variables:
+
+<ParamField path="CC" type="string">
+  The C compiler to use for preprocessing and linking.
+  
+  **Default:** `cc`
+  
+  **Used for:**
+  - Running the C preprocessor
+  - Assembling and linking object files
+  
+  **Examples:**
+  ```bash
+  CC=gcc mcc main.c
+  CC=clang mcc main.c
+  CC=/usr/local/bin/gcc-13 mcc main.c
+  ```
+  
+  **Note:** This is a hidden option not shown in `--help` output but can be overridden.
+</ParamField>
+
+<ParamField path="RUST_LOG" type="string">
+  Control tracing and logging output for compiler internals.
+  
+  **Default:** `warn,mcc=debug,mcc-syntax=debug,mcc-driver=debug`
+  
+  **Log levels:** `trace`, `debug`, `info`, `warn`, `error`
+  
+  **Examples:**
+  ```bash
+  # Maximum verbosity
+  RUST_LOG=trace mcc main.c
+  
+  # Only errors
+  RUST_LOG=error mcc main.c
+  
+  # Debug specific crate
+  RUST_LOG=mcc_syntax=debug mcc main.c
+  
+  # Multiple crates with different levels
+  RUST_LOG=warn,mcc=trace,mcc_syntax=debug mcc main.c
+  ```
+</ParamField>
+
+## Flag Combinations
+
+### Valid Combinations
+
+Many flags can be combined:
+
+```bash
+# Assembly output with custom executable name
+mcc -S -o myprogram main.c
+
+# Stage control with color output
+mcc --parse --color always main.c
+
+# Target specification with assembly output
+mcc --target x86_64-unknown-linux-gnu -S main.c
+
+# Output path with target
+mcc -o bin/server --target x86_64-unknown-linux-gnu server.c
+```
+
+### Invalid Combinations
+
+Stage control flags are mutually exclusive:
+
+```bash
+# ERROR: Cannot specify multiple stage flags
+mcc --parse --tacky main.c
+
+# ERROR: Cannot combine stage flags
+mcc --lex --codegen main.c
+```
+
+## Exit Codes
+
+<ParamField path="0" type="exit code">
+  Success - Compilation completed without errors
+</ParamField>
+
+<ParamField path="Non-zero" type="exit code">
+  Failure - Compilation failed due to:
+  - Syntax errors
+  - Type errors
+  - File I/O errors
+  - Linker errors
+  - Internal compiler errors
+</ParamField>
+
+## Examples
+
+### Basic Compilation
+
+```bash
+# Compile with default settings
+mcc hello.c
+
+# Compile with custom output name
+mcc -o hello hello.c
+```
+
+### Assembly Generation
+
+```bash
+# Keep assembly file
+mcc -S factorial.c
+
+# Keep assembly with custom name
+mcc -S -o factorial factorial.c
+# Creates: factorial (executable) and factorial.s (assembly)
+```
+
+### Stage Debugging
+
+```bash
+# Check if parsing succeeds
+mcc --parse program.c
+
+# Check if type checking succeeds
+mcc --tacky program.c
+
+# Check if code generation succeeds
+mcc --codegen program.c
+```
+
+### Cross-Compilation
+
+```bash
+# Compile for specific target
+mcc --target x86_64-unknown-linux-gnu main.c
+
+# Cross-compile with assembly output
+mcc --target aarch64-unknown-linux-gnu -S main.c
+```
+
+### CI/CD Usage
+
+```bash
+# Disable colors for log files
+mcc --color never main.c 2> build.log
+
+# Use specific compiler
+CC=gcc-12 mcc main.c
+
+# Quiet compilation (errors only)
+RUST_LOG=error mcc main.c
+```
+
+### Development and Debugging
+
+```bash
+# Verbose tracing
+RUST_LOG=trace mcc --tacky main.c
+
+# Debug specific stage
+RUST_LOG=mcc_syntax=debug mcc --parse main.c
+
+# Keep all intermediate files with tracing
+RUST_LOG=debug mcc -S -o debug_build main.c
+```
+
+## Related Documentation
+
+- [Basic Compilation](/commands/compile) - Getting started with mcc
+- [Compilation Stages](/commands/stages) - Detailed stage documentation

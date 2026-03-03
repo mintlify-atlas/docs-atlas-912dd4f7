@@ -1,0 +1,165 @@
+---
+title: Navigating the Codebase
+description: Understanding MCC's code organization and structure
+---
+
+## Project Structure
+
+MCC is organized as a Cargo workspace with multiple crates, each with a specific responsibility:
+
+```
+mcc/
+├── crates/
+│   ├── mcc/           # Core compiler library
+│   ├── mcc-syntax/    # Tree-sitter integration and AST
+│   ├── mcc-driver/    # Command-line interface
+│   ├── mcc-macros/    # Procedural macros
+│   └── xtask/         # Build-time tooling
+├── integration-tests/ # Comprehensive test suite
+└── Cargo.toml        # Workspace configuration
+```
+
+## Crate Overview
+
+### `mcc` - Core Compiler Library
+
+The heart of the compiler, containing the main compilation pipeline. Each compilation stage is implemented as a separate module:
+
+- **`preprocessing`** - Runs the system C preprocessor (via `cc -E -P`)
+- **`parsing`** - Tree-sitter-based parsing with error recovery and validation
+- **`typechecking`** - Builds the High-Level IR (HIR) from the AST; semantic errors are surfaced here
+- **`lowering`** - Transforms HIR into Three Address Code (TAC) via `lower_program`
+- **`codegen`** - Lowers TAC to a target-agnostic assembly IR (`codegen::asm`)
+- **`render`** - Renders the assembly IR to textual assembly, with OS-specific conventions
+- **`assembling`** - Invokes the system compiler to assemble the emitted assembly file into an executable
+
+### `mcc-syntax` - Syntax Layer
+
+Provides strongly-typed AST nodes generated from the tree-sitter grammar. This layer is independent of compilation logic and focuses purely on syntax representation.
+
+**Key principle**: The syntax layer contains no compilation logic.
+
+### `mcc-driver` - Command-Line Interface
+
+Orchestrates the compilation pipeline and handles user interaction. Exposes a `Callbacks` trait fired after each stage:
+- `after_parse`
+- `after_lower`
+- `after_codegen`
+- `after_render_assembly`
+- `after_compile`
+
+**Key principle**: The driver contains no compilation logic, only orchestration.
+
+### `mcc-macros` - Procedural Macros
+
+Contains procedural macros used throughout the codebase.
+
+### `xtask` - Build-Time Tooling
+
+Development utilities and build-time tools following the [xtask pattern](https://github.com/matklad/cargo-xtask).
+
+## Data Flow
+
+The compilation follows a linear pipeline where each stage consumes the output of the previous stage:
+
+```
+Source File
+    ↓
+Preprocessing
+    ↓
+Parsing
+    ↓
+Typecheck (HIR)
+    ↓
+Lowering (TAC)
+    ↓
+Codegen (ASM IR)
+    ↓
+Rendering (assembly text)
+    ↓
+Assembling
+    ↓
+Executable
+```
+
+Each stage is implemented as a Salsa tracked function, enabling incremental compilation and caching of intermediate results.
+
+## Key Types and Abstractions
+
+- **`SourceFile`** - Represents a source file with path and contents
+- **`Ast`** - Wraps the tree-sitter parse tree with strongly-typed accessors
+- **`hir::TranslationUnit`** - High-Level IR produced by typechecking
+- **`tacky::Program`** - Three Address Code (TAC) IR
+- **`codegen::asm::Program`** - Assembly IR (prior to textual rendering)
+- **`Database` / `Db`** - Salsa database/trait for incremental compilation
+- **`Diagnostics`** - Salsa accumulator newtype for collecting diagnostics
+- **`Text`** - Reference-counted string type for efficient memory sharing
+- **`Files`** - File collection for error reporting and source management
+
+## Module Boundaries
+
+### Syntax/Compilation Boundary
+
+The `mcc-syntax` crate provides the AST interface, while `mcc` contains all compilation logic. This boundary ensures that syntax changes don't require recompiling the entire compiler.
+
+### Pipeline Stage Boundaries
+
+Each compilation stage is implemented as a separate module with clear input/output contracts. Stages communicate only through well-defined data structures.
+
+**Architectural invariant**: No compilation stage depends on later stages in the pipeline.
+
+### External Tool Boundary
+
+The compiler delegates preprocessing, assembly, and linking to external tools (typically the system C compiler). This boundary allows the compiler to focus on core compilation logic while leveraging mature external tools.
+
+### Error Handling Boundary
+
+All compilation stages accumulate diagnostics rather than failing immediately, allowing the compiler to report all errors in a single pass.
+
+## Dependencies
+
+MCC uses several key dependencies:
+
+- **[Salsa](https://github.com/salsa-rs/salsa)** - Incremental compilation framework
+- **tree-sitter** - Parsing library
+- **type-sitter** - Strongly-typed tree-sitter bindings
+- **codespan-reporting** - Diagnostic formatting and error reporting
+- **clap** - Command-line argument parsing
+- **anyhow** - Error handling
+- **tracing** - Structured logging
+
+## Finding Your Way Around
+
+### Entry Points
+
+- **CLI**: `crates/mcc-driver/src/main.rs`
+- **Pipeline**: `crates/mcc/src/lib.rs`
+- **AST**: `crates/mcc-syntax/src/lib.rs`
+
+### Common Tasks
+
+**Adding a new compilation stage module**: Modify `crates/mcc/src/` and update the pipeline in the core library.
+
+**Modifying the AST**: Update the tree-sitter grammar source, then regenerate (don't hand-edit generated files).
+
+**Adding CLI options**: Modify `crates/mcc-driver/src/` using clap's derive macros.
+
+**Adding diagnostics**: Use the `Diagnostics` accumulator in the relevant compilation stage.
+
+## Testing
+
+The project includes comprehensive testing:
+
+- **Unit tests**: Located alongside source code in each crate
+- **Doc tests**: Embedded in documentation comments
+- **Integration tests**: Full end-to-end compilation testing against the writing-a-c-compiler-tests suite
+
+See the [integration-tests/README.md](https://github.com/Michael-F-Bryan/mcc/tree/main/integration-tests/README.md) for details on the test framework.
+
+## Target Support
+
+The compiler targets x86_64 by default but is designed to support multiple architectures through the `target-lexicon` crate. The renderer applies OS-specific conventions:
+- macOS: leading underscore on symbols
+- Linux: GNU stack note
+
+Assembly generation is target-specific, while intermediate representations are target-agnostic.

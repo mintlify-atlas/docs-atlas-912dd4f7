@@ -1,0 +1,422 @@
+---
+title: "Lowering"
+description: "HIR to Three-Address Code transformation"
+---
+
+The lowering stage transforms the High-Level Intermediate Representation (HIR) into Three-Address Code (TAC), a linearized instruction-based IR suitable for code generation.
+
+## Overview
+
+Lowering converts structured AST nodes into a flat sequence of three-address instructions, performing variable allocation and control flow linearization.
+
+**Input:** `hir::TranslationUnit<'db>` (via `lower_program`)  
+**Output:** `tacky::Program<'db>` (TAC IR)  
+**Modules:** `crates/mcc/src/lowering/mod.rs`, `crates/mcc/src/lowering/tacky.rs`
+
+## Entry Point
+
+```rust
+#[salsa::tracked]
+pub fn lower_program<'db>(db: &'db dyn Db, file: SourceFile) -> tacky::Program<'db>
+```
+
+This function orchestrates the full pipeline: parse → typecheck → lower. It's the primary entry point used by the driver.
+
+### Pipeline Integration
+
+```rust
+pub fn lower_program<'db>(db: &'db dyn Db, file: SourceFile) -> tacky::Program<'db> {
+    let tu = crate::typechecking::typecheck(db, file);  // Get HIR
+    let mut functions = Vec::new();
+    
+    for item in tu.items(db) {
+        let hir::Item::Function(f) = item;
+        let node = f.node(db).node(db);
+        let body = node.body().ok()?;
+        
+        let mut ctx = FunctionContext::new(db, file);
+        ctx.lower_body(body);  // Transform to TAC
+        
+        functions.push(tacky::FunctionDefinition::new(
+            db,
+            f.name(db).text(db),
+            ctx.instructions,
+            node.span(),
+        ));
+    }
+    
+    tacky::Program::new(db, functions)
+}
+```
+
+## Three-Address Code (TAC)
+
+TAC is defined in `lowering/tacky.rs`:
+
+### Program Structure
+
+```rust
+#[salsa::tracked]
+pub struct Program<'db> {
+    pub functions: Vec<FunctionDefinition<'db>>,
+}
+
+#[salsa::tracked]
+pub struct FunctionDefinition<'db> {
+    pub name: Text,
+    pub instructions: Vec<Instruction>,
+    pub span: Span,
+}
+```
+
+### Instructions
+
+```rust
+pub enum Instruction {
+    Return(Val),
+    Unary { op: UnaryOperator, src: Val, dst: Val },
+    Binary { op: BinaryOperator, left_src: Val, right_src: Val, dst: Val },
+    Comparison { op: ComparisonOperator, left_src: Val, right_src: Val, dst: Val },
+    Copy { src: Val, dst: Val },
+    Jump { target: Text },
+    JumpIfZero { condition: Val, target: Text },
+    JumpIfNotZero { condition: Val, target: Text },
+    Label(Text),
+}
+```
+
+Each instruction has at most three operands ("three-address" form).
+
+### Values and Variables
+
+```rust
+pub enum Val {
+    Constant(i32),
+    Var(Variable),
+}
+
+pub enum Variable {
+    Named(Text),        // Source-level variable names
+    Anonymous(u32),     // Compiler-generated temporaries
+}
+```
+
+### Operators
+
+```rust
+pub enum UnaryOperator {
+    Complement,  // ~x (bitwise NOT)
+    Negate,      // -x
+    Not,         // !x (logical NOT)
+}
+
+pub enum BinaryOperator {
+    Add, Sub, Mul, Div, Mod,        // Arithmetic
+    And, Or, LeftShift, RightShift, // Bitwise
+}
+
+pub enum ComparisonOperator {
+    Equal, NotEqual,
+    LessThan, LessThanOrEqual,
+    GreaterThan, GreaterThanOrEqual,
+}
+```
+
+## Function Context
+
+Lowering is stateful, managed by `FunctionContext`:
+
+```rust
+struct FunctionContext<'db> {
+    db: &'db dyn Db,
+    file: SourceFile,
+    instructions: Vec<tacky::Instruction>,  // Output instructions
+    next_anonymous: u32,                    // Counter for temporaries
+    declared: HashSet<String>,              // Declared variable names
+}
+```
+
+### Body Lowering
+
+```rust
+fn lower_body(&mut self, body: ast::CompoundStatement<'db>) {
+    for child in body.children(&mut cursor) {
+        if let Some(decl) = child.as_declaration() {
+            self.lower_declaration(decl);
+        } else if let Some(stmt) = child.as_statement() {
+            self.lower_statement(stmt);
+        }
+    }
+    // Ensure every path returns
+    self.instructions.push(tacky::Instruction::Return(tacky::Val::Constant(0)));
+}
+```
+
+A fallthrough `return 0` ensures all control paths return.
+
+## Declaration Lowering
+
+```rust
+fn lower_declaration(&mut self, decl: ast::Declaration<'db>) {
+    for declarator in decl.declarators(&mut cursor) {
+        let (ident, init_expr) = /* extract identifier and initializer */;
+        let name = ident.utf8_text(src.as_bytes())?;
+        
+        // Check for redefinition
+        if self.declared.contains(&name) {
+            Diagnostic::error()
+                .with_message("redefinition of variable")
+                .with_code(codes::type_check::redefinition)
+                .accumulate(self.db);
+            continue;
+        }
+        self.declared.insert(name);
+        
+        // Lower initializer if present
+        if let Some(expr) = init_expr {
+            let val = self.lower_expression(expr)?;
+            let dst = tacky::Val::Var(tacky::Variable::Named(name.into()));
+            self.instructions.push(tacky::Instruction::Copy { src: val, dst });
+        }
+    }
+}
+```
+
+Variables without initializers are declared but not assigned.
+
+## Expression Lowering
+
+Expressions are lowered recursively, returning a `Val`:
+
+### Literals
+
+```rust
+fn lower_number_literal(&self, literal: ast::NumberLiteral<'_>) -> Option<tacky::Val> {
+    let value = literal.utf8_text(src.as_bytes()).ok()?.parse().unwrap();
+    Some(tacky::Val::Constant(value))
+}
+```
+
+### Unary Expressions
+
+```rust
+fn lower_unary_expression(&mut self, unary: ast::UnaryExpression<'_>) -> Option<tacky::Val> {
+    let arg = unary.argument().ok()?.as_expression()?;
+    let src = self.lower_expression(arg)?;
+    
+    let dst = tacky::Val::Var(self.temporary());
+    let op = match unary.operator().ok()? {
+        ast::anon_unions::Not_Add_Sub_BitNot::Add(_) => return Some(src),  // +x is no-op
+        ast::anon_unions::Not_Add_Sub_BitNot::Sub(_) => tacky::UnaryOperator::Negate,
+        ast::anon_unions::Not_Add_Sub_BitNot::BitNot(_) => tacky::UnaryOperator::Complement,
+        ast::anon_unions::Not_Add_Sub_BitNot::Not(_) => tacky::UnaryOperator::Not,
+    };
+    
+    self.instructions.push(tacky::Instruction::Unary { op, src, dst: dst.clone() });
+    Some(dst)
+}
+```
+
+### Binary Expressions
+
+```rust
+fn lower_binary_expression(&mut self, binary: ast::BinaryExpression<'_>) -> Option<tacky::Val> {
+    let left = binary.left().ok()?.as_expression()?;
+    let right = binary.right().ok()?.as_expression()?;
+    
+    match binary.operator().ok()? {
+        Op::AndAnd(_) => self.lower_logical_and(left, right),  // Short-circuit
+        Op::OrOr(_) => self.lower_logical_or(left, right),     // Short-circuit
+        op => {
+            let left = self.lower_expression(left)?;
+            let right = self.lower_expression(right)?;
+            self.lower_binary_operator(left, right, tacky_op)
+        }
+    }
+}
+```
+
+**Short-circuit evaluation** for `&&` and `||` requires special handling (see below).
+
+### Assignment
+
+```rust
+fn lower_assignment_expression(&mut self, assign: ast::AssignmentExpression<'_>) -> Option<tacky::Val> {
+    let right_val = self.lower_expression(assign.right().ok()?)?;
+    let ident = assign.left().ok()?.as_identifier()?;
+    
+    // Check that variable is declared
+    let name = ident.utf8_text(src.as_bytes()).ok()?;
+    if !self.declared.contains(name) {
+        Diagnostic::error()
+            .with_message(format!("use of undeclared identifier \"{name}\""))
+            .with_code(codes::type_check::undeclared_identifier)
+            .accumulate(self.db);
+        return None;
+    }
+    
+    let dst = tacky::Val::Var(tacky::Variable::Named(name.into()));
+    self.instructions.push(tacky::Instruction::Copy { src: right_val.clone(), dst });
+    Some(right_val)  // Assignment returns the assigned value
+}
+```
+
+## Control Flow Lowering
+
+### If Statements
+
+```rust
+fn lower_if_statement(&mut self, if_stmt: ast::IfStatement<'db>) {
+    let cond_val = self.lower_expression(cond_expr)?;
+    let else_label = self.label();
+    let end_label = self.label();
+    
+    // Jump to else if condition is zero
+    self.instructions.push(tacky::Instruction::JumpIfZero {
+        condition: cond_val,
+        target: else_label.clone(),
+    });
+    
+    // Then branch
+    self.lower_statement(if_stmt.consequence().ok()?);
+    self.instructions.push(tacky::Instruction::Jump { target: end_label.clone() });
+    
+    // Else branch
+    self.instructions.push(tacky::Instruction::Label(else_label));
+    if let Some(alt) = if_stmt.alternative() {
+        self.lower_statement(alt.child().ok()?);
+    }
+    
+    self.instructions.push(tacky::Instruction::Label(end_label));
+}
+```
+
+### Ternary Operator
+
+Similar structure to if-else:
+
+```rust
+fn lower_conditional_expression(&mut self, cond: ast::ConditionalExpression<'_>) -> Option<tacky::Val> {
+    let cond_val = self.lower_expression(cond.condition().ok()?)?;
+    let else_label = self.label();
+    let end_label = self.label();
+    let result = tacky::Val::Var(self.temporary());
+    
+    self.instructions.push(tacky::Instruction::JumpIfZero { condition: cond_val, target: else_label });
+    let then_val = self.lower_expression(consequence)?;
+    self.instructions.push(tacky::Instruction::Copy { src: then_val, dst: result.clone() });
+    self.instructions.push(tacky::Instruction::Jump { target: end_label });
+    
+    self.instructions.push(tacky::Instruction::Label(else_label));
+    let else_val = self.lower_expression(alternative)?;
+    self.instructions.push(tacky::Instruction::Copy { src: else_val, dst: result.clone() });
+    
+    self.instructions.push(tacky::Instruction::Label(end_label));
+    Some(result)
+}
+```
+
+### Short-Circuit Logical Operators
+
+**Logical AND (`&&`):**
+
+```rust
+fn lower_logical_and(&mut self, left: Expr, right: Expr) -> Option<tacky::Val> {
+    let left_val = self.lower_expression(left)?;
+    let false_label = self.label();
+    let end_label = self.label();
+    let result = tacky::Val::Var(self.temporary());
+    
+    // If left is zero, result is 0
+    self.instructions.push(tacky::Instruction::JumpIfZero { condition: left_val, target: false_label });
+    
+    // Left is non-zero, evaluate right and convert to boolean
+    let right_val = self.lower_expression(right)?;
+    let right_bool = tacky::Val::Var(self.temporary());
+    self.instructions.push(tacky::Instruction::Comparison {
+        op: tacky::ComparisonOperator::NotEqual,
+        left_src: tacky::Val::Constant(0),
+        right_src: right_val,
+        dst: right_bool.clone(),
+    });
+    self.instructions.push(tacky::Instruction::Copy { src: right_bool, dst: result.clone() });
+    self.instructions.push(tacky::Instruction::Jump { target: end_label });
+    
+    // False case
+    self.instructions.push(tacky::Instruction::Label(false_label));
+    self.instructions.push(tacky::Instruction::Copy { src: tacky::Val::Constant(0), dst: result.clone() });
+    
+    self.instructions.push(tacky::Instruction::Label(end_label));
+    Some(result)
+}
+```
+
+**Logical OR (`||`):** Similar, but jumps to true case if left is non-zero.
+
+## Temporary Generation
+
+```rust
+fn temporary(&mut self) -> tacky::Variable {
+    let temp = tacky::Variable::Anonymous(self.next_anonymous);
+    self.next_anonymous += 1;
+    temp
+}
+
+fn label(&mut self) -> Text {
+    let label_name = format!("L{}", self.next_anonymous);
+    self.next_anonymous += 1;
+    label_name.into()
+}
+```
+
+Temporaries and labels share a counter to ensure uniqueness.
+
+## Example
+
+**Input:**
+```c
+int main(void) {
+    int x = 5;
+    int y = x + 3;
+    return y;
+}
+```
+
+**TAC Output:**
+```
+main:
+  Copy src=Constant(5), dst=Var(Named("x"))
+  Binary op=Add, left_src=Var(Named("x")), right_src=Constant(3), dst=Var(Anonymous(0))
+  Copy src=Var(Anonymous(0)), dst=Var(Named("y"))
+  Return Var(Named("y"))
+```
+
+**With Control Flow:**
+```c
+int main(void) {
+    int x = 5;
+    if (x > 3) {
+        return 1;
+    }
+    return 0;
+}
+```
+
+**TAC Output:**
+```
+main:
+  Copy src=Constant(5), dst=Var(Named("x"))
+  Comparison op=GreaterThan, left_src=Var(Named("x")), right_src=Constant(3), dst=Var(Anonymous(0))
+  JumpIfZero condition=Var(Anonymous(0)), target=L1
+  Return Constant(1)
+  Jump target=L2
+  Label(L1)
+  Label(L2)
+  Return Constant(0)
+```
+
+## Related Stages
+
+- **Previous:** [Typechecking](/stages/typechecking) – Produces HIR input
+- **Next:** [Code Generation](/stages/codegen) – Converts TAC to assembly IR
+- **TAC Definition:** `crates/mcc/src/lowering/tacky.rs`

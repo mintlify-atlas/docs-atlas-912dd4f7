@@ -1,0 +1,458 @@
+---
+title: Incremental compilation
+description: Learn how Salsa enables MCC to cache compilation results and reuse them when source files haven't changed
+---
+
+MCC uses [Salsa](https://github.com/salsa-rs/salsa) to enable incremental compilation. When you recompile after making changes, Salsa automatically reuses cached results from unchanged stages, significantly speeding up development cycles.
+
+## What is Salsa?
+
+Salsa is a framework for incremental computation in Rust. It tracks dependencies between function calls and automatically recomputes only what's necessary when inputs change.
+
+<CardGroup cols={2}>
+  <Card title="Tracked functions" icon="function">
+    Functions annotated with `#[salsa::tracked]` are automatically memoized
+  </Card>
+  <Card title="Input tracking" icon="eye">
+    Salsa tracks which inputs each function reads
+  </Card>
+  <Card title="Smart recomputation" icon="bolt">
+    Only reruns functions when their inputs change
+  </Card>
+  <Card title="Accumulators" icon="layer-group">
+    Collects diagnostics without breaking pure functions
+  </Card>
+</CardGroup>
+
+## The Database trait
+
+All compilation functions take a `&dyn Db` parameter. This trait represents the Salsa database:
+
+```rust
+// crates/mcc/src/lib.rs:111
+#[salsa::db]
+pub trait Db: salsa::Database {}
+
+#[salsa::db]
+impl<T: salsa::Database> Db for T {}
+```
+
+The concrete implementation stores Salsa's internal state:
+
+```rust
+// crates/mcc/src/lib.rs:118
+#[salsa::db]
+#[derive(Default, Clone)]
+pub struct Database {
+    storage: salsa::Storage<Self>,
+}
+
+#[salsa::db]
+impl salsa::Database for Database {}
+```
+
+<Note>
+  The `Database` struct is cheap to clone. Cloning creates a new view with the same cached results.
+</Note>
+
+## Tracked functions
+
+Each compilation stage is a tracked function. Salsa automatically memoizes the results:
+
+<Tabs>
+  <Tab title="Parsing">
+    ```rust
+    // crates/mcc/src/parsing.rs:15
+    #[salsa::tracked]
+    pub fn parse(db: &dyn Db, file: SourceFile) -> Ast<'_> {
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&tree_sitter::Language::new(tree_sitter_c::LANGUAGE))
+            .unwrap();
+        
+        let src = file.contents(db);
+        let tree = Tree::from(parser.parse(src, None).unwrap());
+        
+        check_tree(db, &tree, file);
+        Ast::new(db, tree)
+    }
+    ```
+    
+    When you call `parse(&db, file)` again with the same `file`, Salsa returns the cached `Ast` without re-parsing.
+  </Tab>
+  
+  <Tab title="Typechecking">
+    ```rust
+    // crates/mcc/src/typechecking/mod.rs:23
+    #[salsa::tracked]
+    pub fn typecheck(db: &dyn Db, file: SourceFile) -> hir::TranslationUnit<'_> {
+        let ast = crate::parse(db, file);
+        if !crate::parse::accumulated::<Diagnostics>(db, file).is_empty() {
+            return hir::TranslationUnit::new(db, Vec::new(), file);
+        }
+        
+        // ... typechecking logic
+        hir::TranslationUnit::new(db, items, file)
+    }
+    ```
+    
+    `typecheck` calls `parse(db, file)`, which returns instantly if already cached. If parsing didn't change, typechecking also returns instantly.
+  </Tab>
+  
+  <Tab title="Lowering">
+    ```rust
+    // crates/mcc/src/lowering/mod.rs:716
+    #[salsa::tracked]
+    pub fn lower_program(db: &dyn Db, file: SourceFile) -> tacky::Program<'_> {
+        let tu = crate::typechecking::typecheck(db, file);
+        let file_ref = tu.file(db);
+        let mut functions = Vec::new();
+        
+        for item in tu.items(db) {
+            // ... lowering logic
+        }
+        
+        tacky::Program::new(db, functions)
+    }
+    ```
+    
+    If parsing and typechecking are cached, `lower_program` skips those stages entirely.
+  </Tab>
+  
+  <Tab title="Code generation">
+    ```rust
+    // crates/mcc/src/codegen/mod.rs:10
+    #[salsa::tracked]
+    pub fn generate_assembly(db: &dyn Db, program: tacky::Program<'_>) 
+        -> asm::Program<'_> {
+        let mut functions = Vec::new();
+        for function in program.functions(db) {
+            functions.push(lower_function(db, function));
+        }
+        asm::Program::new(db, functions)
+    }
+    ```
+    
+    Cached if the TAC program hasn't changed.
+  </Tab>
+  
+  <Tab title="Rendering">
+    ```rust
+    // crates/mcc/src/render.rs:13
+    #[salsa::tracked]
+    pub fn render_program(db: &dyn Db, program: asm::Program<'_>, target: Triple) 
+        -> Text {
+        let mut output = String::new();
+        let mut renderer = AssemblyRenderer::new(target, &mut output);
+        renderer.program(db, program)
+            .expect("formatting should never fail");
+        output.into()
+    }
+    ```
+    
+    Cached if the assembly IR and target triple haven't changed.
+  </Tab>
+</Tabs>
+
+## Tracked structs
+
+Salsa can also track structs, making them efficient to store and compare:
+
+```rust
+// crates/mcc/src/typechecking/hir.rs:14
+#[salsa::tracked(debug)]
+pub struct TranslationUnit<'db> {
+    #[returns(ref)]
+    pub items: Vec<Item<'db>>,
+    pub file: SourceFile,
+}
+
+#[salsa::tracked(debug)]
+pub struct FunctionDefinition<'db> {
+    pub name: Identifier<'db>,
+    pub node: ptr::FunctionDefinition<'db>,
+}
+```
+
+Tracked structs are lightweight handles. The actual data is stored in the Salsa database:
+
+<CodeGroup>
+```rust Creating
+// Allocates in the database
+let tu = hir::TranslationUnit::new(db, items, file);
+```
+
+```rust Accessing
+// Reads from the database
+let items = tu.items(db);
+let file = tu.file(db);
+```
+
+```rust Comparing
+// Cheap equality check (compares handles, not contents)
+if tu1 == tu2 { ... }
+```
+</CodeGroup>
+
+## Interned values
+
+Identifiers are interned for efficient comparison:
+
+```rust
+// crates/mcc/src/typechecking/hir.rs:42
+#[salsa::interned(debug)]
+#[derive(PartialOrd, Ord)]
+pub struct Identifier {
+    pub text: Text,
+}
+
+impl<'db> Identifier<'db> {
+    pub fn from_node(
+        db: &'db dyn Db,
+        file: SourceFile,
+        node: mcc_syntax::ast::Identifier<'db>,
+    ) -> Self {
+        let src = file.contents(db);
+        let name = node.utf8_text(src.as_bytes()).expect("unreachable");
+        Identifier::new(db, Text::from(name))
+    }
+}
+```
+
+Interning ensures that identical identifiers share the same storage and can be compared with simple pointer equality.
+
+## Accumulators for diagnostics
+
+Salsa accumulators allow tracked functions to "push" diagnostics without returning them:
+
+```rust
+// crates/mcc/src/diagnostics.rs
+#[salsa::accumulator]
+pub struct Diagnostics(Diagnostic);
+
+impl DiagnosticExt for Diagnostic {
+    fn accumulate(self, db: &dyn crate::Db) {
+        Diagnostics::push(db, self);
+    }
+}
+```
+
+Stages accumulate diagnostics during compilation:
+
+```rust
+// crates/mcc/src/typechecking/mod.rs:82
+Diagnostic::error()
+    .with_message("Expected a return type for function")
+    .with_code(codes::type_check::missing_return_type)
+    .with_labels(vec![
+        Label::primary(file, Span::for_node(*raw))
+            .with_message("error occurred here"),
+    ])
+    .accumulate(db);  // Pushed to accumulator
+```
+
+Retrieve accumulated diagnostics after a stage completes:
+
+```rust
+// crates/mcc/src/lowering/mod.rs:700
+pub fn lower_stage_diagnostics(
+    db: &dyn Db,
+    file: SourceFile,
+) -> Vec<&crate::diagnostics::Diagnostics> {
+    let typecheck_diags = 
+        crate::typechecking::typecheck::accumulated::<Diagnostics>(db, file);
+    let lower_diags = 
+        lower_program::accumulated::<Diagnostics>(db, file);
+    typecheck_diags.into_iter().chain(lower_diags).collect()
+}
+```
+
+<Accordion title="Why use accumulators?">
+Accumulators solve a key problem: how to collect diagnostics while keeping compilation functions pure (returning a single value).
+
+Without accumulators, you'd need to return `(Result, Vec<Diagnostic>)` from every function, complicating signatures and making composition harder.
+
+With accumulators:
+- Functions remain simple: `fn parse(db: &dyn Db, file: SourceFile) -> Ast`
+- Diagnostics are collected separately: `parse::accumulated::<Diagnostics>(db, file)`
+- Salsa tracks accumulated values just like function results
+</Accordion>
+
+## How dependency tracking works
+
+Salsa automatically tracks dependencies between function calls:
+
+<Steps>
+  <Step title="First compilation">
+    ```rust
+    let db = Database::default();
+    let file = SourceFile::new(&db, "main.c".into(), "int main() {}".into());
+    let tacky = lower_program(&db, file);
+    ```
+    
+    Salsa records that:
+    - `lower_program(file)` called `typecheck(file)`
+    - `typecheck(file)` called `parse(file)`
+    - `parse(file)` read `file.contents()`
+  </Step>
+  
+  <Step title="Source file changes">
+    ```rust
+    // Modify the source
+    let file = SourceFile::new(&db, "main.c".into(), "int main() { return 1; }".into());
+    ```
+    
+    Salsa marks `file.contents()` as changed.
+  </Step>
+  
+  <Step title="Recompilation">
+    ```rust
+    let tacky = lower_program(&db, file);
+    ```
+    
+    Salsa automatically:
+    1. Detects that `file.contents()` changed
+    2. Invalidates `parse(file)` (depends on contents)
+    3. Invalidates `typecheck(file)` (depends on parse)
+    4. Invalidates `lower_program(file)` (depends on typecheck)
+    5. Reruns all invalidated functions
+  </Step>
+  
+  <Step title="Unchanged dependencies are reused">
+    If a function depends on something that didn't change, it returns the cached result immediately.
+    
+    For example, if you only change code generation logic (not source code), parsing, typechecking, and lowering all return cached results.
+  </Step>
+</Steps>
+
+## Incremental compilation example
+
+<Tabs>
+  <Tab title="Full compilation">
+    ```rust
+    let db = Database::default();
+    let file = SourceFile::new(
+        &db, 
+        "main.c".into(), 
+        "int main(void) { return 0; }".into()
+    );
+    
+    // First compilation - nothing cached
+    let ast = parse(&db, file);              // Runs parser
+    let hir = typecheck(&db, file);          // Runs typechecker
+    let tacky = lower_program(&db, file);    // Runs lowering
+    let asm = generate_assembly(&db, tacky); // Runs codegen
+    ```
+  </Tab>
+  
+  <Tab title="No changes">
+    ```rust
+    // Call again with same file
+    let ast = parse(&db, file);              // Cached ✓
+    let hir = typecheck(&db, file);          // Cached ✓
+    let tacky = lower_program(&db, file);    // Cached ✓
+    let asm = generate_assembly(&db, tacky); // Cached ✓
+    
+    // All stages return instantly
+    ```
+  </Tab>
+  
+  <Tab title="Source changed">
+    ```rust
+    // Modify source
+    let file = SourceFile::new(
+        &db,
+        "main.c".into(),
+        "int main(void) { return 1; }".into()  // Changed!
+    );
+    
+    let ast = parse(&db, file);              // Reruns (input changed)
+    let hir = typecheck(&db, file);          // Reruns (depends on parse)
+    let tacky = lower_program(&db, file);    // Reruns (depends on typecheck)
+    let asm = generate_assembly(&db, tacky); // Reruns (depends on lowering)
+    ```
+  </Tab>
+  
+  <Tab title="Only target changed">
+    ```rust
+    // Same source, different target
+    let asm = generate_assembly(&db, tacky); // Cached ✓
+    let text1 = render_program(&db, asm, linux_target);  // Runs
+    let text2 = render_program(&db, asm, macos_target);  // Runs (different target)
+    
+    // Everything except rendering is cached
+    ```
+  </Tab>
+</Tabs>
+
+## Per-function caching
+
+Salsa tracks individual functions within a program:
+
+```rust
+// crates/mcc/src/codegen/mod.rs:22
+#[salsa::tracked]
+fn lower_function(db: &dyn Db, function: tacky::FunctionDefinition<'_>) 
+    -> asm::FunctionDefinition<'_> {
+    let asm = to_assembly(db, function);
+    fix_up_instructions(db, asm)
+}
+```
+
+If a program has multiple functions and you only modify one, Salsa only recompiles that function.
+
+<Note>
+  Currently MCC only supports single-function programs (`main`), but the infrastructure supports multi-function caching.
+</Note>
+
+## Benefits of incremental compilation
+
+<Check>**Fast iteration cycles** - Recompiling after small changes is nearly instant</Check>
+<Check>**Efficient testing** - Test suites reuse cached results across test cases</Check>
+<Check>**Lazy evaluation** - Only computes what's actually needed</Check>
+<Check>**Composability** - Stages can call each other freely without worrying about redundant work</Check>
+
+## Example usage
+
+```rust
+// Quick start from lib.rs:27
+use mcc::{Database, SourceFile, Text};
+
+let db = Database::default();
+let src = "int main(void) { return 0; }";
+let file = SourceFile::new(&db, Text::from("main.c"), Text::from(src));
+
+// Parse → typecheck → TAC → ASM IR → assembly text
+let ast = mcc::parse(&db, file);
+let tacky = mcc::lowering::lower_program(&db, file);
+let asm_ir = mcc::codegen::generate_assembly(&db, tacky);
+let asm_text = mcc::render_program(&db, asm_ir, mcc::default_target());
+
+assert!(asm_text.as_str().contains("main"));
+
+// Compile again - all stages return cached results
+let asm_text = mcc::render_program(
+    &db, 
+    mcc::codegen::generate_assembly(
+        &db, 
+        mcc::lowering::lower_program(&db, file)
+    ),
+    mcc::default_target()
+);
+```
+
+## Learn more
+
+<CardGroup cols={2}>
+  <Card title="Salsa documentation" icon="book" href="https://salsa-rs.github.io/salsa/">
+    Official Salsa documentation and examples
+  </Card>
+  <Card title="Architecture" icon="sitemap" href="/concepts/architecture">
+    Learn about MCC's overall architecture
+  </Card>
+  <Card title="Pipeline" icon="diagram-project" href="/concepts/pipeline">
+    Understand the seven compilation stages
+  </Card>
+  <Card title="Salsa book" icon="graduation-cap" href="https://salsa-rs.github.io/salsa/">
+    Deep dive into Salsa's design and implementation
+  </Card>
+</CardGroup>

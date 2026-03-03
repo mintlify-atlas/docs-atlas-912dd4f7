@@ -1,0 +1,270 @@
+---
+title: Running Integration Tests
+description: How to run and configure MCC's integration test suite
+---
+
+The integration test suite validates the compiler against the comprehensive [writing-a-c-compiler-tests](https://github.com/nlsandler/writing-a-c-compiler-tests) test suite. Tests use libtest-mimic to provide a familiar Rust testing interface.
+
+## Quick Start
+
+### Running All Tests
+
+From the repository root:
+
+```bash
+cargo test -p integration-tests --test integration
+```
+
+This runs all tests up to the configured `MAX_CHAPTER` limit (currently chapter 6).
+
+### Running Ignored Tests
+
+Tests beyond the chapter cap are marked as ignored:
+
+```bash
+cargo test -p integration-tests --test integration -- --ignored
+```
+
+This runs tests above the chapter limit, useful for development of later features.
+
+## Test Filtering
+
+libtest-mimic provides standard Rust test filtering:
+
+### By Chapter
+
+```bash
+# Run all chapter 1 tests
+cargo test -p integration-tests --test integration -- chapter_1
+
+# Run all chapter 3 tests
+cargo test -p integration-tests --test integration -- chapter_3
+```
+
+### By Test Kind
+
+```bash
+# Run only valid tests
+cargo test -p integration-tests --test integration -- ::valid::
+
+# Run only parse error tests
+cargo test -p integration-tests --test integration -- ::invalid_parse::
+
+# Run only semantic error tests
+cargo test -p integration-tests --test integration -- ::invalid_semantics::
+```
+
+### By Specific Test
+
+```bash
+# Run a specific test
+cargo test -p integration-tests --test integration -- chapter_1::valid::return_2
+
+# Run all tests matching a pattern
+cargo test -p integration-tests --test integration -- return
+```
+
+### Combined Filters
+
+```bash
+# Run all valid tests in chapter 3
+cargo test -p integration-tests --test integration -- chapter_3::valid
+
+# Run all parse error tests across all chapters
+cargo test -p integration-tests --test integration -- invalid_parse
+```
+
+## Test Output
+
+### Success Output
+
+```bash
+$ cargo test -p integration-tests --test integration -- chapter_1::valid
+
+Running 2 tests
+test chapter_1::valid::return_0 ... ok
+test chapter_1::valid::return_2 ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored
+```
+
+### Failure Output
+
+When a test fails, the framework provides detailed diagnostics:
+
+```bash
+test chapter_3::valid::add ... FAILED
+
+failures:
+
+---- chapter_3::valid::add ----
+Error: expected return code 5, got exit status: 3
+```
+
+For invalid tests that should fail but don't:
+
+```bash
+test chapter_1::invalid_parse::missing_semicolon ... FAILED
+
+failures:
+
+---- chapter_1::invalid_parse::missing_semicolon ----
+Error: expected error at parse, but compilation succeeded
+```
+
+## libtest-mimic Options
+
+The test binary supports standard libtest-mimic arguments:
+
+### List Tests
+
+```bash
+# List all tests without running them
+cargo test -p integration-tests --test integration -- --list
+
+# Count total tests
+cargo test -p integration-tests --test integration -- --list | wc -l
+```
+
+### Exact Matching
+
+```bash
+# Run only exact match (not substring)
+cargo test -p integration-tests --test integration -- --exact chapter_1::valid::return_2
+```
+
+### Show Output
+
+```bash
+# Show output even for passing tests
+cargo test -p integration-tests --test integration -- --nocapture
+```
+
+### Test Threads
+
+```bash
+# Run tests serially (useful for debugging)
+cargo test -p integration-tests --test integration -- --test-threads=1
+
+# Run with specific number of threads
+cargo test -p integration-tests --test integration -- --test-threads=4
+```
+
+## Using cargo nextest
+
+The integration tests also work with [cargo nextest](https://nexte.st/), which provides faster test execution:
+
+```bash
+# Run all tests
+cargo nextest run -p integration-tests --test integration
+
+# Run with filters
+cargo nextest run -p integration-tests --test integration -E 'test(chapter_1)'
+
+# Run ignored tests
+cargo nextest run -p integration-tests --test integration --run-ignored ignored-only
+```
+
+nextest provides:
+- Faster test execution through better parallelism
+- Cleaner test output with progress indicators
+- Better failure reporting
+- Test retries and flake detection
+
+## CI Integration
+
+In continuous integration, run the full test suite:
+
+```bash
+# Run all non-ignored tests
+cargo nextest run --workspace --locked
+
+# Or specifically for integration tests
+cargo nextest run -p integration-tests --test integration --locked
+```
+
+## Environment Variables
+
+The test framework respects standard environment variables:
+
+### CC Variable
+
+```bash
+# Use a specific C compiler for assembly/linking
+CC=clang cargo test -p integration-tests --test integration
+
+# Use GCC explicitly
+CC=gcc cargo test -p integration-tests --test integration
+```
+
+The `CC` variable determines which compiler is used to:
+- Run the preprocessor (`cc -E -P`)
+- Assemble and link the final binary
+
+### RUST_LOG Variable
+
+```bash
+# Enable debug logging
+RUST_LOG=debug cargo test -p integration-tests --test integration -- chapter_1::valid::return_2
+
+# Enable trace logging for specific modules
+RUST_LOG=mcc::codegen=trace cargo test -p integration-tests --test integration
+```
+
+## Troubleshooting
+
+### No Tests Discovered
+
+If no tests are discovered:
+
+1. Verify the `writing-a-c-compiler-tests` submodule is initialized:
+   ```bash
+   git submodule update --init --recursive
+   ```
+
+2. Check that test directories exist:
+   ```bash
+   ls integration-tests/writing-a-c-compiler-tests/tests/
+   ```
+
+### Tests Failing Unexpectedly
+
+1. **Check compiler features**: Ensure your compiler supports the features being tested
+
+2. **Verify expected results**: Check `expected_results.json` for the correct expectations
+
+3. **Run with logging**: Enable debug output to see compilation details:
+   ```bash
+   RUST_LOG=debug cargo test -p integration-tests --test integration -- chapter_1::valid::return_2 --nocapture
+   ```
+
+4. **Run serially**: Disable parallel execution to isolate issues:
+   ```bash
+   cargo test -p integration-tests --test integration -- --test-threads=1
+   ```
+
+### Compilation Stage Mismatches
+
+If tests are failing at unexpected stages, check for structural differences:
+
+- MCC may report errors at different stages than expected by the book
+- See the `ignored` array in `integration.rs` for examples
+- Consider whether the difference is intentional or a bug
+
+### Performance Issues
+
+If tests are slow:
+
+1. **Use nextest**: `cargo nextest` is significantly faster than `cargo test`
+
+2. **Limit chapters**: Adjust `MAX_CHAPTER` in `integration.rs` during development
+
+3. **Filter tests**: Run only the tests you're working on:
+   ```bash
+   cargo test -p integration-tests --test integration -- chapter_3::valid
+   ```
+
+4. **Use release builds**: For faster test execution (slower compilation):
+   ```bash
+   cargo test -p integration-tests --test integration --release
+   ```

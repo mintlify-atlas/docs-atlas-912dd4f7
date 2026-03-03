@@ -1,0 +1,305 @@
+---
+title: Extending the Compiler
+description: How to add new features and extend MCC
+---
+
+## Overview
+
+This guide explains how to extend the MCC compiler with new features while respecting architectural boundaries and maintaining the project's principles of simplicity and maintainability.
+
+## Understanding the Architecture
+
+Before extending the compiler, understand the core architectural invariants:
+
+- No compilation stage depends on later stages in the pipeline
+- The syntax layer (`mcc-syntax`) contains no compilation logic
+- All compilation stages are implemented as pure functions with Salsa tracking
+- Error handling is non-fatal - compilation continues to collect all errors
+- The driver crate contains no compilation logic, only orchestration
+
+## Adding New Pipeline Stages
+
+<Warning>
+Adding new pipeline stages changes the core architecture and should be done with extreme caution. Always discuss with maintainers first.
+</Warning>
+
+### When to Add a Stage
+
+Consider adding a new pipeline stage when:
+- The transformation is conceptually distinct from existing stages
+- The stage produces a new intermediate representation
+- The stage benefits from independent incremental compilation
+
+### How to Add a Stage
+
+1. **Define the IR**: Create a new module in `mcc` with the intermediate representation
+2. **Implement as Salsa tracked function**: Make the stage incremental
+3. **Update the pipeline**: Modify the compilation pipeline to include the new stage
+4. **Add callbacks**: Update `mcc-driver` to expose callbacks for the new stage
+5. **Write tests**: Add comprehensive tests for the new stage
+
+```rust
+// In crates/mcc/src/my_new_stage.rs
+
+#[salsa::tracked]
+pub fn my_new_stage(
+    db: &dyn crate::Db,
+    input: InputType,
+) -> OutputType {
+    // Stage implementation
+    // Use Diagnostics::push() for error reporting
+}
+```
+
+## Modifying Existing Stages
+
+### Adding Features to a Stage
+
+When adding features to an existing compilation stage:
+
+1. **Read the stage implementation**: Understand current patterns and invariants
+2. **Keep changes minimal**: Add only what's necessary
+3. **Follow existing patterns**: Match the style and structure of surrounding code
+4. **Update tests**: Add tests for the new feature
+
+### Example: Adding a New AST Node Type
+
+1. **Update the tree-sitter grammar** (don't hand-edit generated files)
+2. **Regenerate the AST**: Run the appropriate xtask command
+3. **Update typechecking**: Handle the new node in HIR generation
+4. **Update lowering**: Transform the HIR to TAC
+5. **Update codegen**: Generate assembly for the new construct
+6. **Add tests**: Include valid and invalid test cases
+
+## Working with Salsa
+
+### Tracked Functions
+
+All compilation stages are Salsa tracked functions. This enables incremental compilation:
+
+```rust
+#[salsa::tracked]
+pub fn compile_stage(
+    db: &dyn crate::Db,
+    input: Input,
+) -> Output {
+    // Salsa automatically tracks dependencies
+    // and caches results
+}
+```
+
+### Accumulators for Diagnostics
+
+Use the `Diagnostics` accumulator to report errors without stopping compilation:
+
+```rust
+use crate::diagnostics::Diagnostics;
+
+#[salsa::tracked]
+pub fn my_stage(db: &dyn crate::Db, input: Input) -> Output {
+    if some_error {
+        Diagnostics::push(
+            db,
+            diagnostic::error()
+                .with_message("Error message")
+                .with_labels(vec![/* ... */])
+        );
+    }
+    // Continue processing
+}
+```
+
+<Warning>
+Do not change Salsa tracking or break incremental compilation invariants unless absolutely necessary.
+</Warning>
+
+## Extending the CLI
+
+### Adding Command-Line Options
+
+Modify `mcc-driver` to add new CLI options:
+
+```rust
+// In crates/mcc-driver/src/main.rs or args.rs
+
+#[derive(Debug, clap::Parser)]
+pub struct Args {
+    // Existing fields...
+    
+    /// Description of your new option
+    #[arg(long)]
+    pub my_new_option: bool,
+}
+```
+
+### Using Options in the Pipeline
+
+Pass options through the compilation pipeline as needed:
+
+1. Store options in the Salsa database
+2. Access them in tracked functions
+3. Adjust behavior based on the options
+
+## Adding Optimization Passes
+
+Optimization passes typically operate on the TAC IR:
+
+1. **Create a new module** in the appropriate stage (often in `lowering` or between stages)
+2. **Implement as a transformation**: Take IR as input, return modified IR
+3. **Make it optional**: Use CLI flags to enable/disable
+4. **Add tests**: Include performance benchmarks if relevant
+
+```rust
+pub fn optimize_tac(program: tacky::Program) -> tacky::Program {
+    // Transformation logic
+    // Examples: constant folding, dead code elimination,
+    // register allocation improvements
+}
+```
+
+## Adding New Target Architectures
+
+### Current Architecture
+
+The compiler currently targets x86_64. To add a new architecture:
+
+1. **Create target-specific codegen**: Implement code generation for the new target
+2. **Create target-specific renderer**: Handle OS-specific conventions
+3. **Update target detection**: Use `target-lexicon` for target selection
+4. **Keep IRs target-agnostic**: Don't modify TAC or HIR
+
+### Architecture-Specific Code
+
+- **Codegen**: `crates/mcc/src/codegen/` - Assembly IR generation
+- **Render**: `crates/mcc/src/render/` - OS and architecture-specific assembly text
+
+## Testing Your Extensions
+
+### Unit Tests
+
+Add unit tests in the relevant module:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_my_feature() {
+        // Test implementation
+    }
+}
+```
+
+### Integration Tests
+
+Add test cases to the writing-a-c-compiler-tests suite or create custom integration tests:
+
+```bash
+# Run integration tests
+cargo test -p integration-tests --test integration
+
+# Test specific chapters
+cargo test -p integration-tests --test integration -- chapter_1
+```
+
+### Snapshot Tests
+
+Use [insta](https://insta.rs/) for snapshot testing of IR representations:
+
+```rust
+#[test]
+fn test_ir_generation() {
+    let output = generate_ir(input);
+    insta::assert_debug_snapshot!(output);
+}
+```
+
+## Best Practices for Extensions
+
+### Do
+
+- Read existing code to understand patterns
+- Keep changes small and focused
+- Write tests for new features
+- Document public APIs
+- Use descriptive names
+- Follow Rust idioms
+
+### Don't
+
+- Add unnecessary abstractions
+- Duplicate code across files
+- Break architectural boundaries without discussion
+- Skip verification commands
+- Hand-edit generated files
+- Introduce new dependencies without justification
+
+## Common Extension Patterns
+
+### Adding a New Language Feature
+
+1. Update tree-sitter grammar
+2. Regenerate AST
+3. Handle in typechecking (HIR)
+4. Handle in lowering (TAC)
+5. Handle in codegen (assembly)
+6. Add tests (valid and invalid cases)
+
+### Adding a New Diagnostic
+
+1. Identify the compilation stage where the error occurs
+2. Use `Diagnostics::push()` to report the error
+3. Provide clear error messages and source spans
+4. Add tests for the diagnostic
+
+### Adding a New Command-Line Flag
+
+1. Add to `Args` struct in `mcc-driver`
+2. Pass through to relevant compilation stages
+3. Document the flag's behavior
+4. Add integration tests with the flag enabled/disabled
+
+## Getting Help
+
+When in doubt:
+
+1. **Read ARCHITECTURE.md** for architectural guidance
+2. **Search the codebase** for similar patterns
+3. **Check existing tests** for examples
+4. **Discuss with maintainers** before major changes
+
+## Example: Adding Constant Folding
+
+Here's a complete example of adding a simple optimization:
+
+```rust
+// In crates/mcc/src/optimizations/constant_folding.rs
+
+use crate::tacky::{Program, Instruction, Value};
+
+pub fn fold_constants(program: Program) -> Program {
+    // Walk the TAC and fold constant expressions
+    // Example: Replace "x = 2 + 3" with "x = 5"
+    
+    program.map_instructions(|instr| {
+        match instr {
+            Instruction::Binary { op, left, right, dest } => {
+                if let (Value::Constant(l), Value::Constant(r)) = (left, right) {
+                    // Compute at compile time
+                    let result = evaluate(op, l, r);
+                    Instruction::Copy {
+                        src: Value::Constant(result),
+                        dest,
+                    }
+                } else {
+                    instr
+                }
+            }
+            _ => instr,
+        }
+    })
+}
+```
+
+Then integrate it into the pipeline and add tests.

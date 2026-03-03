@@ -1,0 +1,248 @@
+---
+title: Database
+description: Salsa-powered incremental compilation database
+---
+
+The `Database` struct is the core of MCC's incremental compilation system, powered by the [Salsa](https://github.com/salsa-rs/salsa) framework. It tracks queries and their dependencies, enabling efficient recomputation when inputs change.
+
+## Database Struct
+
+```rust
+#[salsa::db]
+#[derive(Default, Clone)]
+pub struct Database {
+    storage: salsa::Storage<Self>,
+}
+```
+
+The `Database` stores all tracked data for the compilation session. It implements the `Db` trait and Salsa's `Database` trait.
+
+### Creating a Database
+
+```rust
+use mcc::Database;
+
+let db = Database::default();
+```
+
+The database is cheap to clone (copy-on-write semantics) but typically you'll pass `&db` to all pipeline functions.
+
+## Db Trait
+
+```rust
+#[salsa::db]
+pub trait Db: salsa::Database {}
+```
+
+The `Db` trait is automatically implemented for any type that implements `salsa::Database`. All pipeline functions accept `&dyn Db` to remain agnostic to the concrete database type.
+
+### Blanket Implementation
+
+```rust
+#[salsa::db]
+impl<T: salsa::Database> Db for T {}
+```
+
+This allows any Salsa database to work with MCC's pipeline.
+
+## Salsa Integration
+
+Salsa provides incremental computation through tracked functions and input queries:
+
+### Input Queries
+
+`SourceFile` is a Salsa input:
+
+```rust
+#[salsa::input]
+pub struct SourceFile {
+    #[returns(ref)]
+    pub path: Text,
+    #[returns(ref)]
+    pub contents: Text,
+}
+```
+
+Inputs are the leaves of the dependency graph. When you change an input, Salsa invalidates dependent computations.
+
+### Tracked Queries
+
+Most pipeline stages are Salsa tracked functions:
+
+```rust
+// Parsing is tracked
+let ast = mcc::parse(&db, file); // Cached if `file` hasn't changed
+
+// Lowering is tracked
+let tacky = mcc::lowering::lower_program(&db, file); // Cached if AST is unchanged
+
+// Codegen is tracked
+let asm = mcc::codegen::generate_assembly(&db, tacky); // Cached if TAC is unchanged
+```
+
+Salsa memoizes results and only recomputes when dependencies change.
+
+## Tracked Types
+
+### Ast
+
+```rust
+#[salsa::tracked]
+pub struct Ast<'db> {
+    #[returns(ref)]
+    pub tree: Tree,
+}
+```
+
+The parsed AST is a tracked Salsa type. Methods on `Ast` can also be tracked:
+
+```rust
+#[salsa::tracked]
+impl<'db> Ast<'db> {
+    pub fn sexpr(&self, db: &'db dyn Db) -> impl Display {
+        SexpPrinter::new(self.tree(db).root_node())
+    }
+
+    pub fn root(&self, db: &'db dyn Db) -> ast::TranslationUnit<'db> {
+        let root = self.tree(db).root_node();
+        ast::TranslationUnit::try_from_raw(root).unwrap()
+    }
+}
+```
+
+## Incremental Recompilation Example
+
+```rust
+use mcc::{Database, SourceFile, Text};
+
+let db = Database::default();
+
+// First compilation
+let file = SourceFile::new(&db, "main.c".into(), "int main() { return 0; }".into());
+let ast1 = mcc::parse(&db, file);
+let tacky1 = mcc::lowering::lower_program(&db, file);
+
+// Modify the source
+file.set_contents(&db).to("int main() { return 42; }".into());
+
+// Salsa detects the change and recomputes only affected stages
+let ast2 = mcc::parse(&db, file); // Re-parsed
+let tacky2 = mcc::lowering::lower_program(&db, file); // Re-lowered
+```
+
+<Note>
+In practice, you'd create a new `SourceFile` rather than mutating it, since `SourceFile` is typically treated as immutable. The example above shows the conceptual model.
+</Note>
+
+## Lifetimes and Ownership
+
+Most tracked types have a `'db` lifetime parameter:
+
+```rust
+pub struct Ast<'db> { /* ... */ }
+pub struct Program<'db> { /* ... */ } // tacky::Program
+pub struct Program<'db> { /* ... */ } // asm::Program
+```
+
+These types borrow data from the database and cannot outlive it. This ensures safety and enables Salsa's incremental recomputation.
+
+### Example: Lifetime Constraints
+
+```rust
+use mcc::{Database, SourceFile, Text, Ast};
+
+fn parse_file(db: &Database, src: &str) -> Ast<'_> {
+    let file = SourceFile::new(db, "input.c".into(), src.into());
+    mcc::parse(db, file)
+}
+
+// The returned Ast borrows from the database
+let db = Database::default();
+let ast = parse_file(&db, "int x;");
+// `ast` is valid as long as `db` is alive
+```
+
+## Diagnostics Accumulation
+
+The database also tracks diagnostics via Salsa's accumulator pattern:
+
+```rust
+use mcc::diagnostics::Diagnostics;
+
+let db = Database::default();
+let file = SourceFile::new(&db, "test.c".into(), "int main() {}".into());
+
+// Parse the file
+let _ = mcc::parse(&db, file);
+
+// Retrieve accumulated diagnostics
+let diags: Vec<&Diagnostics> = mcc::parse::accumulated::<Diagnostics>(&db, file);
+```
+
+See [Diagnostics](/api/diagnostics) for details on the accumulator pattern.
+
+## Thread Safety
+
+`Database` is `Clone` but not `Send` or `Sync` by default. For multi-threaded use:
+
+<Warning>
+The current `Database` implementation is designed for single-threaded use. Parallel compilation is not yet supported. Clone the database if you need isolated compilation sessions.
+</Warning>
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Pass by reference">
+    Always pass `&db` or `&dyn Db` to pipeline functions. Avoid cloning unless you need isolated sessions.
+    
+    ```rust
+    let db = Database::default();
+    let ast = mcc::parse(&db, file); // Pass by reference
+    ```
+  </Accordion>
+
+  <Accordion title="Treat inputs as immutable">
+    Create new `SourceFile` instances rather than mutating existing ones:
+    
+    ```rust
+    let file1 = SourceFile::new(&db, "main.c".into(), "// version 1".into());
+    let file2 = SourceFile::new(&db, "main.c".into(), "// version 2".into());
+    ```
+  </Accordion>
+
+  <Accordion title="Use tracked methods">
+    When adding methods to tracked types, mark them with `#[salsa::tracked]` to enable caching:
+    
+    ```rust
+    #[salsa::tracked]
+    impl<'db> Ast<'db> {
+        pub fn my_query(&self, db: &'db dyn Db) -> MyResult {
+            // This result will be cached
+        }
+    }
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Related Types
+
+<CardGroup cols={2}>
+  <Card title="SourceFile" icon="file-code">
+    `SourceFile` is the primary input to the database, representing a source file with path and contents.
+  </Card>
+  <Card title="Ast" icon="code-branch">
+    `Ast<'db>` is a tracked type containing the parsed syntax tree.
+  </Card>
+  <Card title="Text" icon="text">
+    `Text` is a reference-counted string (`Arc<str>`) used for efficient string storage.
+  </Card>
+  <Card title="Tree" icon="sitemap">
+    `Tree` wraps `tree_sitter::Tree` with `Eq` for Salsa compatibility.
+  </Card>
+</CardGroup>
+
+## Further Reading
+
+- [Salsa Documentation](https://salsa-rs.github.io/salsa/)
+- [Diagnostics](/api/diagnostics) - Learn about error accumulation
+- [API Overview](/api/overview) - High-level API usage patterns

@@ -1,0 +1,268 @@
+---
+title: Installation
+description: Install Rust and build MCC from source
+---
+
+## Prerequisites
+
+MCC requires:
+
+- **Rust 1.93.0 or later** - MCC uses Rust 2024 edition features
+- **A C compiler** - For preprocessing, assembling, and linking (typically `cc` or `clang`)
+- **Git** - To clone the repository with submodules
+
+<Note>
+  MCC delegates preprocessing, assembly, and linking to your system's C compiler. Make sure `cc` or `clang` is available in your PATH.
+</Note>
+
+## Install Rust
+
+If you don't have Rust installed, use rustup:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+Verify your installation:
+
+```bash
+rustc --version
+cargo --version
+```
+
+You should see Rust 1.93.0 or later.
+
+## Clone the Repository
+
+Clone MCC with its submodules (includes the writing-a-c-compiler-tests suite):
+
+```bash
+git clone --recursive https://github.com/Michael-F-Bryan/mcc.git
+cd mcc
+```
+
+If you already cloned without `--recursive`, initialize submodules:
+
+```bash
+git submodule update --init --recursive
+```
+
+## Build from Source
+
+MCC uses a Cargo workspace with multiple crates. Build the entire workspace:
+
+<CodeGroup>
+
+```bash Debug Build
+# Fast compilation, slower runtime (good for development)
+cargo build --workspace --locked
+```
+
+```bash Release Build
+# Optimized build (recommended for actual use)
+cargo build --workspace --locked --release
+```
+
+</CodeGroup>
+
+The `--locked` flag ensures you use the exact dependency versions from `Cargo.lock`.
+
+<Note>
+  The debug binary will be at `target/debug/mcc` and the release binary at `target/release/mcc`.
+</Note>
+
+## Verify Installation
+
+Check that the compiler builds successfully:
+
+```bash
+cargo check --workspace --locked
+```
+
+Run the test suite to verify everything works:
+
+```bash
+# Install nextest for faster test execution
+cargo install cargo-nextest --locked
+
+# Run all tests
+cargo nextest run --workspace --locked
+
+# Run doc tests
+cargo test --doc --workspace --locked
+```
+
+<Warning>
+  Tests require a C compiler (clang or gcc) to be available. Set the `CC` environment variable if you need to use a specific compiler: `CC=clang cargo nextest run`
+</Warning>
+
+## Install the Binary (Optional)
+
+To install `mcc` to your Cargo bin directory (`~/.cargo/bin`):
+
+```bash
+cargo install --path crates/mcc-driver --locked
+```
+
+Now you can run `mcc` from anywhere:
+
+```bash
+mcc --help
+```
+
+## Project Structure
+
+After building, you'll have this structure:
+
+```
+mcc/
+├── crates/
+│   ├── mcc/              # Core compiler library
+│   ├── mcc-syntax/       # Tree-sitter AST integration
+│   ├── mcc-driver/       # CLI binary (the `mcc` command)
+│   ├── mcc-macros/       # Procedural macros
+│   └── xtask/            # Build utilities
+├── integration-tests/    # Test framework
+│   └── writing-a-c-compiler-tests/  # Test suite (submodule)
+├── target/
+│   ├── debug/mcc         # Debug binary
+│   └── release/mcc       # Release binary
+└── Cargo.toml            # Workspace configuration
+```
+
+## Development Setup
+
+### Install Additional Tools
+
+For development, install these optional tools:
+
+<CodeGroup>
+
+```bash Formatting
+# rustfmt is included with rustup
+cargo fmt --all -- --check
+```
+
+```bash Linting
+# clippy is included with rustup
+cargo clippy --workspace
+```
+
+```bash Testing
+# nextest for faster test execution
+cargo install cargo-nextest --locked
+```
+
+</CodeGroup>
+
+### IDE Integration
+
+MCC works well with rust-analyzer:
+
+- **VS Code**: Install the rust-analyzer extension
+- **Vim/Neovim**: Use coc-rust-analyzer or native LSP
+- **IntelliJ IDEA**: Use the Rust plugin
+
+The workspace configuration in `Cargo.toml` ensures rust-analyzer understands the multi-crate structure.
+
+## Running CI Checks Locally
+
+Before committing, run the same checks as CI:
+
+```bash
+# Type check
+cargo check --workspace --locked
+
+# Build
+cargo build --workspace --locked
+
+# Test
+cargo nextest run --workspace --locked
+cargo test --doc --workspace --locked
+
+# Format
+cargo fmt --all -- --check
+
+# Lint
+cargo clippy --workspace
+```
+
+<Note>
+  The CI runs on both Ubuntu and macOS to ensure cross-platform compatibility. All tests must pass on both platforms.
+</Note>
+
+## Integration Tests
+
+MCC includes comprehensive integration tests based on the writing-a-c-compiler-tests suite:
+
+```bash
+# Run integration tests (default chapter cap)
+cargo test -p integration-tests --test integration
+
+# Run all tests including ignored ones
+cargo test -p integration-tests --test integration -- --ignored
+
+# Test specific chapters
+cargo test -p integration-tests --test integration -- chapter_1
+```
+
+See the [Testing Framework](/testing/framework) documentation for details on:
+
+- Test organization by chapters (1-20)
+- Stage-specific testing (lex, parse, tacky, codegen)
+- Extra credit features (bitwise, compound, increment, goto, switch)
+
+## Environment Variables
+
+MCC respects these environment variables:
+
+| Variable | Description | Default |
+|----------|-------------|--------|
+| `CC` | C compiler for preprocessing/linking | `cc` |
+| `RUST_LOG` | Logging level (mcc=debug, mcc-syntax=debug) | `warn` |
+
+Example:
+
+```bash
+CC=clang RUST_LOG=mcc=debug cargo run -- input.c
+```
+
+## Troubleshooting
+
+### Build Fails with "could not find `Cargo.toml`"
+
+Make sure you're in the repository root, not a subdirectory.
+
+### Tests Fail with "cc: command not found"
+
+Install a C compiler:
+
+```bash
+# Ubuntu/Debian
+sudo apt-get install build-essential
+
+# macOS (installs clang)
+xcode-select --install
+```
+
+### Submodule Not Found
+
+Initialize submodules:
+
+```bash
+git submodule update --init --recursive
+```
+
+### Rust Version Too Old
+
+Update Rust:
+
+```bash
+rustup update stable
+```
+
+## Next Steps
+
+<Card title="Quick Start" icon="rocket" href="/quickstart">
+  Compile your first C program with MCC
+</Card>

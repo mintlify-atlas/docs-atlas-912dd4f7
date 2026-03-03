@@ -1,0 +1,137 @@
+---
+title: Introduction
+description: A self-hosting C compiler written in Rust with incremental compilation and comprehensive testing
+---
+
+## Welcome to MCC
+
+MCC (Michael's C Compiler) is a self-hosting C compiler written in Rust that transforms C source code into executable machine code through a complete compilation pipeline. Built with modern tooling and designed for correctness, MCC demonstrates how to build a production-quality compiler with incremental compilation, error recovery, and comprehensive test coverage.
+
+<CardGroup cols={2}>
+  <Card title="Complete Pipeline" icon="diagram-project">
+    Seven distinct stages from preprocessing through assembly, with clear separation of concerns and well-defined intermediate representations
+  </Card>
+  
+  <Card title="Incremental Compilation" icon="bolt">
+    Powered by Salsa for fast development cycles—only recomputes what changed in your source files
+  </Card>
+  
+  <Card title="Comprehensive Testing" icon="vial">
+    Built on the writing-a-c-compiler-tests suite with 20 chapters of progressive language features
+  </Card>
+  
+  <Card title="Modern Rust Codebase" icon="rust">
+    Clean architecture with tree-sitter parsing, strong typing, and zero-cost abstractions
+  </Card>
+</CardGroup>
+
+## Architecture Overview
+
+MCC follows a classic compiler pipeline where each stage consumes the output of the previous stage:
+
+<Steps>
+  <Step title="Preprocessing">
+    Runs the system C preprocessor (`cc -E -P`) to handle includes, macros, and conditional compilation
+  </Step>
+  
+  <Step title="Parsing">
+    Tree-sitter-based parsing with error recovery produces a strongly-typed AST
+  </Step>
+  
+  <Step title="Typechecking">
+    Builds High-Level IR (HIR) from the AST and performs semantic analysis
+  </Step>
+  
+  <Step title="Lowering">
+    Transforms HIR into Three Address Code (TAC), a simplified intermediate representation
+  </Step>
+  
+  <Step title="Code Generation">
+    Lowers TAC to target-agnostic assembly IR with register allocation
+  </Step>
+  
+  <Step title="Rendering">
+    Converts assembly IR to textual assembly with OS-specific conventions (macOS symbol prefixes, Linux stack notes)
+  </Step>
+  
+  <Step title="Assembling">
+    Invokes the system compiler to assemble and link the final executable
+  </Step>
+</Steps>
+
+## Key Features
+
+### Incremental Compilation with Salsa
+
+Every compilation stage is implemented as a Salsa tracked function, enabling:
+
+- **Cached results** - Reuse previously computed ASTs, IR, and assembly when source files haven't changed
+- **Fine-grained invalidation** - Only recompute what's affected by your edits
+- **Fast iteration** - Dramatically reduced compile times during development
+
+### Error Recovery and Diagnostics
+
+MCC uses codespan-reporting to provide helpful diagnostics:
+
+- **Non-fatal errors** - Compilation continues to collect all errors in a single pass
+- **Precise source locations** - Errors point to exact lines and columns in your code
+- **Accumulated diagnostics** - Each stage can emit multiple warnings and errors
+
+### Multi-Target Support
+
+Built on `target-lexicon` for cross-platform compilation:
+
+- **x86_64 primary target** - Generates optimized x64 assembly
+- **OS-specific conventions** - Handles macOS vs Linux symbol naming and stack notes
+- **Extensible architecture** - Designed to support additional targets
+
+### Modular Crate Structure
+
+The project is organized into focused crates:
+
+```
+mcc/
+├── mcc              # Core compilation pipeline and IR
+├── mcc-syntax       # Tree-sitter integration and AST
+├── mcc-driver       # CLI interface and orchestration
+├── mcc-macros       # Procedural macros
+└── integration-tests # Test framework and suite
+```
+
+<Note>
+  The modular design ensures that syntax changes don't require recompiling the entire compiler, and the driver contains no compilation logic—only orchestration.
+</Note>
+
+## Architectural Invariants
+
+MCC maintains strict boundaries to ensure maintainability:
+
+- **Linear dependencies** - No compilation stage depends on later stages
+- **Pure syntax layer** - `mcc-syntax` contains no compilation logic
+- **Salsa tracking** - All stages are pure functions with incremental computation
+- **Non-fatal errors** - Diagnostics accumulate rather than panicking
+- **External tools** - Delegates preprocessing, assembly, and linking to the system compiler
+
+## What You'll Learn
+
+By exploring MCC's source code and documentation, you'll understand:
+
+- How to structure a multi-stage compiler with clear module boundaries
+- Implementing incremental compilation with Salsa
+- Using tree-sitter for robust parsing with error recovery
+- Designing intermediate representations (HIR, TAC, Assembly IR)
+- Generating x86_64 assembly from high-level constructs
+- Building comprehensive test infrastructure for a compiler
+- Integrating with system tooling (preprocessor, assembler, linker)
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Installation" icon="download" href="/installation">
+    Install Rust and build MCC from source
+  </Card>
+  
+  <Card title="Quick Start" icon="rocket" href="/quickstart">
+    Compile your first C program with MCC
+  </Card>
+</CardGroup>

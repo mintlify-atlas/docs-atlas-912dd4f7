@@ -1,80 +1,414 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: Quick Start
+description: Compile your first C program with MCC in under 5 minutes
 ---
 
-## Get started in three steps
+## Your First Compilation
 
-Get your documentation site running locally and make your first customization.
+Let's compile a simple C program with MCC and explore the compilation pipeline.
 
-### Step 1: Set up your local environment
-
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
+<Steps>
+  <Step title="Create a C source file">
+    Create a file named `hello.c`:
     
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
+    ```c hello.c
+    int main(void) {
+        return 0;
+    }
+    ```
+  </Step>
+  
+  <Step title="Compile with MCC">
+    Run the MCC compiler:
     
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
-
-### Step 2: Deploy your changes
-
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
+    ```bash
+    mcc hello.c -o hello
+    ```
     
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+    This will:
+    - Preprocess with the system C compiler
+    - Parse using tree-sitter
+    - Typecheck and build HIR
+    - Lower to Three Address Code (TAC)
+    - Generate assembly IR
+    - Render to x86_64 assembly text
+    - Assemble and link to create an executable
+  </Step>
+  
+  <Step title="Run your program">
+    Execute the compiled binary:
+    
+    ```bash
+    ./hello
+    echo $?  # Prints: 0
+    ```
+  </Step>
+</Steps>
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+Congratulations! You've successfully compiled and run your first program with MCC.
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+## Exploring Compilation Stages
 
-### Step 3: Go live
+MCC allows you to stop at any compilation stage to inspect intermediate representations.
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+### Stop After Parsing
 
-## Next steps
+Inspect the AST without generating code:
 
-Now that you have your docs running, explore these key features:
+```bash
+mcc --parse hello.c
+```
 
-<CardGroup cols={2}>
+This runs preprocessing and parsing, then exits. Useful for debugging parse errors.
 
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
+### Stop After Lowering to TAC
 
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
+See the Three Address Code intermediate representation:
 
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
+```bash
+mcc --tacky hello.c
+```
 
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
+TAC is a simplified IR where each instruction performs at most one operation. This stage happens after typechecking and HIR construction.
 
-</CardGroup>
+### Stop After Code Generation
+
+Generate assembly IR but don't render to text:
+
+```bash
+mcc --codegen hello.c
+```
+
+This produces the assembly IR (target-agnostic representation) without rendering to textual assembly.
+
+### Keep Assembly Output
+
+Generate assembly text and save it to a file:
+
+```bash
+mcc -S hello.c -o hello
+```
+
+This creates `hello.s` with the generated x86_64 assembly. On macOS, you'll see symbol names with leading underscores (`_main`). On Linux, you'll see a `.note.GNU-stack` section.
+
+<CodeGroup>
+
+```asm x86_64 Assembly (macOS)
+    .globl _main
+_main:
+    pushq   %rbp
+    movq    %rsp, %rbp
+    movl    $0, %eax
+    popq    %rbp
+    retq
+```
+
+```asm x86_64 Assembly (Linux)
+    .globl main
+main:
+    pushq   %rbp
+    movq    %rsp, %rbp
+    movl    $0, %eax
+    popq    %rbp
+    retq
+    .section .note.GNU-stack,"",@progbits
+```
+
+</CodeGroup>
+
+## Command-Line Options
+
+MCC supports these options:
+
+| Option | Description |
+|--------|-------------|
+| `-o <file>` | Specify output file |
+| `-S` | Keep assembly file (creates `.s` file) |
+| `--parse` | Stop after parsing |
+| `--tacky` | Stop after lowering to TAC |
+| `--codegen` | Stop after code generation |
+| `--lex` | Stop after lexing (rarely used) |
+| `--target <triple>` | Specify target triple (default: x86_64-unknown-linux-gnu on Linux, x86_64-apple-darwin on macOS) |
+| `--color <when>` | Control colored output (auto/always/never) |
 
 <Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
+  The `CC` environment variable controls which C compiler is used for preprocessing and linking. Default is `cc`.
 </Note>
+
+## Working with Real Programs
+
+### Compile a Program with Functions
+
+Create `factorial.c`:
+
+```c factorial.c
+int factorial(int n) {
+    if (n <= 1) {
+        return 1;
+    }
+    return n * factorial(n - 1);
+}
+
+int main(void) {
+    return factorial(5);  // Returns 120
+}
+```
+
+Compile and run:
+
+```bash
+mcc factorial.c -o factorial
+./factorial
+echo $?  # Prints: 120
+```
+
+### View Generated Assembly
+
+See how MCC compiles functions:
+
+```bash
+mcc -S factorial.c -o factorial
+cat factorial.s
+```
+
+You'll see the calling convention, stack frame setup, and recursive call handling.
+
+## Handling Errors
+
+MCC provides detailed diagnostics when compilation fails.
+
+### Parse Error Example
+
+Create `broken.c`:
+
+```c broken.c
+int main(void) {
+    return 0
+}  // Missing semicolon
+```
+
+Compile:
+
+```bash
+mcc broken.c
+```
+
+You'll see an error message with:
+- The exact file and line number
+- A snippet of the problematic code
+- A helpful error message
+
+<Warning>
+  MCC accumulates all errors in a single pass, so you may see multiple errors at once. Fix them one at a time, starting from the top.
+</Warning>
+
+### Type Error Example
+
+Create `type_error.c`:
+
+```c type_error.c
+int main(void) {
+    int x;
+    return x + "hello";  // Can't add int and string
+}
+```
+
+MCC's typechecker will catch this during semantic analysis and show which types are incompatible.
+
+## Using MCC as a Library
+
+You can also use MCC programmatically from Rust code:
+
+```rust
+use mcc::{Database, SourceFile, Text};
+
+let db = Database::default();
+let src = "int main(void) { return 0; }";
+let file = SourceFile::new(&db, Text::from("main.c"), Text::from(src));
+
+// Parse the source
+let ast = mcc::parse(&db, file);
+
+// Lower to TAC
+let tacky = mcc::lowering::lower_program(&db, file);
+
+// Generate assembly IR
+let asm_ir = mcc::codegen::generate_assembly(&db, tacky);
+
+// Render to assembly text
+let asm_text = mcc::render_program(&db, asm_ir, mcc::default_target()).unwrap();
+
+assert!(asm_text.as_str().contains("main"));
+```
+
+### Capturing Diagnostics
+
+Use Salsa accumulators to collect diagnostics:
+
+```rust
+use mcc::{Database, SourceFile, Text, diagnostics::Diagnostics};
+
+let db = Database::default();
+let file = SourceFile::new(&db, "test.c".into(), "int main(void) {}".into());
+
+let _ = mcc::parse(&db, file);
+let diags: Vec<&Diagnostics> = mcc::parse::accumulated::<Diagnostics>(&db, file);
+
+for diag in diags {
+    println!("Diagnostic: {:?}", diag);
+}
+```
+
+### Using Callbacks
+
+The `mcc-driver` crate provides a callback API for observing compilation stages:
+
+```rust
+use std::ops::ControlFlow;
+use mcc_driver::{Callbacks, Config, Outcome};
+use mcc::{Ast, Text, diagnostics::Diagnostics, codegen::asm, lowering::tacky};
+
+struct MyCallbacks;
+
+impl Callbacks for MyCallbacks {
+    type Output = ();
+
+    fn after_parse<'db>(
+        &mut self,
+        _db: &'db dyn mcc::Db,
+        _source_file: mcc::SourceFile,
+        _ast: Ast<'db>,
+        diags: Vec<&Diagnostics>,
+    ) -> ControlFlow<Self::Output> {
+        println!("Parse stage produced {} diagnostics", diags.len());
+        ControlFlow::Continue(())
+    }
+
+    fn after_lower<'db>(
+        &mut self,
+        _db: &'db dyn mcc::Db,
+        tacky: tacky::Program<'db>,
+        _diags: Vec<&Diagnostics>,
+    ) -> ControlFlow<Self::Output> {
+        println!("Lowering produced TAC: {:?}", tacky);
+        ControlFlow::Continue(())
+    }
+
+    fn after_codegen<'db>(
+        &mut self,
+        _db: &'db dyn mcc::Db,
+        _asm: asm::Program<'db>,
+        _diags: Vec<&Diagnostics>,
+    ) -> ControlFlow<Self::Output> {
+        ControlFlow::Continue(())
+    }
+
+    fn after_render_assembly(
+        &mut self,
+        _db: &dyn mcc::Db,
+        asm: Text,
+        _diags: Vec<&Diagnostics>,
+    ) -> ControlFlow<Self::Output> {
+        println!("Generated {} bytes of assembly", asm.len());
+        ControlFlow::Continue(())
+    }
+}
+```
+
+This allows you to hook into each compilation stage for testing, analysis, or debugging.
+
+## Debugging Compilation
+
+### Enable Logging
+
+MCC uses tracing for detailed logging:
+
+```bash
+# Debug logging for mcc modules
+RUST_LOG=mcc=debug,mcc-syntax=debug mcc hello.c
+
+# Trace everything
+RUST_LOG=trace mcc hello.c
+```
+
+You'll see detailed information about each compilation stage, including:
+- Preprocessing commands
+- Parse tree construction
+- Typecheck passes
+- IR transformations
+- Assembly generation
+
+### Use Different C Compilers
+
+Switch between C compilers for preprocessing:
+
+<CodeGroup>
+
+```bash Clang
+CC=clang mcc hello.c
+```
+
+```bash GCC
+CC=gcc mcc hello.c
+```
+
+</CodeGroup>
+
+### Cross-Compilation
+
+Specify a target triple:
+
+```bash
+mcc --target x86_64-unknown-linux-gnu hello.c
+mcc --target x86_64-apple-darwin hello.c
+```
+
+<Note>
+  Cross-compilation only changes assembly rendering (symbol prefixes, stack notes). You still need the appropriate linker and system libraries for the target platform.
+</Note>
+
+## Running the Test Suite
+
+MCC includes a comprehensive test suite based on the writing-a-c-compiler-tests framework:
+
+```bash
+# Run integration tests
+cargo test -p integration-tests --test integration
+
+# Run tests for specific chapters
+cargo test -p integration-tests --test integration -- chapter_1
+
+# Run all tests including ignored ones
+cargo test -p integration-tests --test integration -- --ignored
+```
+
+The test suite is organized into 20 chapters representing progressive language features:
+
+- **Chapters 1-3**: Basic lexing, parsing, and unary operators
+- **Chapters 4-6**: Binary operators, variables, control flow
+- **Chapters 7-10**: Functions, pointers, arrays
+- **Chapters 11-18**: Advanced features (structs, unions, etc.)
+- **Chapter 19**: Optimizations
+- **Chapter 20**: Register allocation
+
+## Next Steps
+
+Now that you've compiled your first program, explore:
+
+<CardGroup cols={2}>
+  <Card title="Architecture" icon="diagram-project" href="/concepts/architecture">
+    Understand MCC's compilation pipeline and IR design
+  </Card>
+  
+  <Card title="API Reference" icon="code" href="https://michael-f-bryan.github.io/mcc">
+    Browse the complete Rust API documentation
+  </Card>
+  
+  <Card title="Testing" icon="vial" href="/testing/framework">
+    Learn about MCC's comprehensive test framework
+  </Card>
+  
+  <Card title="Contributing" icon="git-alt" href="/development/contributing">
+    Contribute to MCC development
+  </Card>
+</CardGroup>

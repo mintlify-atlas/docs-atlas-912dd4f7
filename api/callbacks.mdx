@@ -1,0 +1,579 @@
+---
+title: Callbacks
+description: Hook into compilation stages with the driver API
+---
+
+The `mcc-driver` crate provides a callback-based API for observing and controlling the compilation pipeline. This is useful for building tools, tests, and custom workflows.
+
+## Overview
+
+The [`run`](/api/callbacks#run-function) function executes the full compilation pipeline and calls trait methods at each stage:
+
+1. Preprocessing
+2. Parsing → `after_parse`
+3. Lowering → `after_lower`
+4. Code generation → `after_codegen`
+5. Rendering → `after_render_assembly`
+6. Assembling & linking → `after_compile`
+
+Callbacks can inspect intermediate results, collect diagnostics, or stop the pipeline early.
+
+## Callbacks Trait
+
+```rust
+pub trait Callbacks {
+    type Output;
+
+    fn after_parse<'db>(
+        &mut self,
+        _db: &'db dyn mcc::Db,
+        _source_file: mcc::SourceFile,
+        _ast: Ast<'db>,
+        _diags: Vec<&Diagnostics>,
+    ) -> ControlFlow<Self::Output> {
+        ControlFlow::Continue(())
+    }
+
+    fn after_lower<'db>(
+        &mut self,
+        _db: &'db dyn mcc::Db,
+        _tacky: tacky::Program<'db>,
+        _diags: Vec<&Diagnostics>,
+    ) -> ControlFlow<Self::Output> {
+        ControlFlow::Continue(())
+    }
+
+    fn after_codegen<'db>(
+        &mut self,
+        _db: &'db dyn mcc::Db,
+        _asm: asm::Program<'db>,
+        _diags: Vec<&Diagnostics>,
+    ) -> ControlFlow<Self::Output> {
+        ControlFlow::Continue(())
+    }
+
+    fn after_render_assembly(
+        &mut self,
+        _db: &dyn mcc::Db,
+        _asm: Text,
+        _diags: Vec<&Diagnostics>,
+    ) -> ControlFlow<Self::Output> {
+        ControlFlow::Continue(())
+    }
+
+    fn after_compile(
+        &mut self,
+        _db: &dyn mcc::Db,
+        _binary: PathBuf,
+    ) -> ControlFlow<Self::Output> {
+        ControlFlow::Continue(())
+    }
+}
+```
+
+### Type Parameter: Output
+
+```rust
+type Output;
+```
+
+The `Output` associated type specifies what value is returned when the pipeline stops early (via `ControlFlow::Break`).
+
+### Return Type: ControlFlow
+
+Each callback returns `std::ops::ControlFlow<Self::Output>`:
+
+- `ControlFlow::Continue(())` - Continue to the next stage
+- `ControlFlow::Break(value)` - Stop the pipeline and return `value`
+
+## Callback Methods
+
+### after_parse
+
+```rust
+fn after_parse<'db>(
+    &mut self,
+    _db: &'db dyn mcc::Db,
+    _source_file: mcc::SourceFile,
+    _ast: Ast<'db>,
+    _diags: Vec<&Diagnostics>,
+) -> ControlFlow<Self::Output>
+```
+
+Called after parsing the source file.
+
+<ParamField path="db" type="&'db dyn mcc::Db">
+  The compilation database
+</ParamField>
+
+<ParamField path="source_file" type="SourceFile">
+  The source file that was parsed (after preprocessing)
+</ParamField>
+
+<ParamField path="ast" type="Ast<'db>">
+  The abstract syntax tree
+</ParamField>
+
+<ParamField path="diags" type="Vec<&Diagnostics>">
+  Diagnostics accumulated during parsing
+</ParamField>
+
+### after_lower
+
+```rust
+fn after_lower<'db>(
+    &mut self,
+    _db: &'db dyn mcc::Db,
+    _tacky: tacky::Program<'db>,
+    _diags: Vec<&Diagnostics>,
+) -> ControlFlow<Self::Output>
+```
+
+Called after lowering the AST to three-address code (TAC).
+
+<ParamField path="db" type="&'db dyn mcc::Db">
+  The compilation database
+</ParamField>
+
+<ParamField path="tacky" type="tacky::Program<'db>">
+  The three-address code representation
+</ParamField>
+
+<ParamField path="diags" type="Vec<&Diagnostics>">
+  Diagnostics accumulated during lowering
+</ParamField>
+
+### after_codegen
+
+```rust
+fn after_codegen<'db>(
+    &mut self,
+    _db: &'db dyn mcc::Db,
+    _asm: asm::Program<'db>,
+    _diags: Vec<&Diagnostics>,
+) -> ControlFlow<Self::Output>
+```
+
+Called after generating assembly IR from TAC.
+
+<ParamField path="db" type="&'db dyn mcc::Db">
+  The compilation database
+</ParamField>
+
+<ParamField path="asm" type="asm::Program<'db>">
+  The assembly IR representation
+</ParamField>
+
+<ParamField path="diags" type="Vec<&Diagnostics>">
+  Diagnostics accumulated during code generation
+</ParamField>
+
+### after_render_assembly
+
+```rust
+fn after_render_assembly(
+    &mut self,
+    _db: &dyn mcc::Db,
+    _asm: Text,
+    _diags: Vec<&Diagnostics>,
+) -> ControlFlow<Self::Output>
+```
+
+Called after rendering assembly IR to text.
+
+<ParamField path="db" type="&dyn mcc::Db">
+  The compilation database
+</ParamField>
+
+<ParamField path="asm" type="Text">
+  The rendered assembly text
+</ParamField>
+
+<ParamField path="diags" type="Vec<&Diagnostics>">
+  Diagnostics accumulated during rendering
+</ParamField>
+
+### after_compile
+
+```rust
+fn after_compile(
+    &mut self,
+    _db: &dyn mcc::Db,
+    _binary: PathBuf,
+) -> ControlFlow<Self::Output>
+```
+
+Called after assembling and linking the final binary.
+
+<ParamField path="db" type="&dyn mcc::Db">
+  The compilation database
+</ParamField>
+
+<ParamField path="binary" type="PathBuf">
+  Path to the compiled executable
+</ParamField>
+
+## Config
+
+```rust
+pub struct Config {
+    pub db: mcc::Database,
+    pub target: Triple,
+    pub cc: OsString,
+    pub output: Option<PathBuf>,
+    pub input: SourceFile,
+}
+```
+
+Configuration for a compilation session.
+
+<ParamField path="db" type="Database">
+  The compilation database
+</ParamField>
+
+<ParamField path="target" type="Triple">
+  Target triple (e.g., `x86_64-unknown-linux-gnu`)
+</ParamField>
+
+<ParamField path="cc" type="OsString">
+  C compiler command for preprocessing/linking (e.g., `"cc"` or `"gcc"`)
+</ParamField>
+
+<ParamField path="output" type="Option<PathBuf>">
+  Output path for the binary. If `None`, uses input path without extension.
+</ParamField>
+
+<ParamField path="input" type="SourceFile">
+  The input source file
+</ParamField>
+
+## Outcome
+
+```rust
+pub enum Outcome<Ret> {
+    Ok,
+    Err(anyhow::Error),
+    EarlyReturn(Ret),
+}
+```
+
+The result of running the compiler.
+
+<ResponseField name="Ok">
+  Compilation succeeded
+</ResponseField>
+
+<ResponseField name="Err" type="anyhow::Error">
+  Compilation failed with an error
+</ResponseField>
+
+<ResponseField name="EarlyReturn" type="Ret">
+  Compilation stopped early via a callback (contains the `Output` value)
+</ResponseField>
+
+### Methods
+
+```rust
+impl<Ret> Outcome<Ret> {
+    pub fn to_result(self) -> Result<(), anyhow::Error>;
+    pub fn to_result_with(
+        self,
+        f: impl FnOnce(Ret) -> Result<(), anyhow::Error>,
+    ) -> Result<(), anyhow::Error>;
+}
+```
+
+**`to_result`**: Convert to `Result`, treating early returns as errors.
+
+**`to_result_with`**: Convert to `Result`, applying a custom handler for early returns.
+
+## run Function
+
+```rust
+pub fn run<C: Callbacks>(cb: &mut C, cfg: Config) -> Outcome<C::Output>
+```
+
+Executes the compilation pipeline with callbacks.
+
+<ParamField path="cb" type="&mut C" required>
+  The callbacks implementation
+</ParamField>
+
+<ParamField path="cfg" type="Config" required>
+  Compilation configuration
+</ParamField>
+
+<ResponseField name="return" type="Outcome<C::Output>">
+  The result of compilation
+</ResponseField>
+
+## Example: Noop Callbacks
+
+The simplest implementation does nothing:
+
+```rust
+use std::ops::ControlFlow;
+use mcc_driver::{Callbacks, Config, Outcome};
+use mcc::{Ast, Text, diagnostics::Diagnostics, codegen::asm, lowering::tacky};
+
+struct Noop;
+
+impl Callbacks for Noop {
+    type Output = ();
+
+    fn after_parse<'db>(
+        &mut self,
+        _db: &'db dyn mcc::Db,
+        _source_file: mcc::SourceFile,
+        _ast: Ast<'db>,
+        _diags: Vec<&Diagnostics>,
+    ) -> ControlFlow<Self::Output> {
+        ControlFlow::Continue(())
+    }
+
+    fn after_lower<'db>(
+        &mut self,
+        _db: &'db dyn mcc::Db,
+        _tacky: tacky::Program<'db>,
+        _diags: Vec<&Diagnostics>,
+    ) -> ControlFlow<Self::Output> {
+        ControlFlow::Continue(())
+    }
+
+    fn after_codegen<'db>(
+        &mut self,
+        _db: &'db dyn mcc::Db,
+        _asm: asm::Program<'db>,
+        _diags: Vec<&Diagnostics>,
+    ) -> ControlFlow<Self::Output> {
+        ControlFlow::Continue(())
+    }
+
+    fn after_render_assembly(
+        &mut self,
+        _db: &dyn mcc::Db,
+        _asm: Text,
+        _diags: Vec<&Diagnostics>,
+    ) -> ControlFlow<Self::Output> {
+        ControlFlow::Continue(())
+    }
+}
+```
+
+## Example: Stop After Parse
+
+Return the AST and stop the pipeline:
+
+```rust
+use std::ops::ControlFlow;
+use mcc_driver::{Callbacks, Config, Outcome, run};
+use mcc::{Ast, SourceFile, Text, Database, default_target};
+
+struct StopAfterParse {
+    result: Option<Ast<'static>>,
+}
+
+impl Callbacks for StopAfterParse {
+    type Output = ();
+
+    fn after_parse<'db>(
+        &mut self,
+        _db: &'db dyn mcc::Db,
+        _source_file: SourceFile,
+        ast: Ast<'db>,
+        diags: Vec<&mcc::diagnostics::Diagnostics>,
+    ) -> ControlFlow<Self::Output> {
+        if !diags.is_empty() {
+            eprintln!("Parse errors:");
+            for diag in diags {
+                eprintln!("  {}", diag.message);
+            }
+        }
+        // Stop the pipeline after parsing
+        ControlFlow::Break(())
+    }
+}
+
+let db = Database::default();
+let file = SourceFile::new(&db, "test.c".into(), "int main() {}".into());
+
+let config = Config {
+    db: db.clone(),
+    target: default_target(),
+    cc: "cc".into(),
+    output: None,
+    input: file,
+};
+
+let mut cb = StopAfterParse { result: None };
+let outcome = run(&mut cb, config);
+
+match outcome {
+    Outcome::EarlyReturn(()) => println!("Stopped after parse"),
+    Outcome::Ok => println!("Unexpectedly completed"),
+    Outcome::Err(e) => eprintln!("Error: {}", e),
+}
+```
+
+## Example: Collect All Diagnostics
+
+```rust
+use std::ops::ControlFlow;
+use mcc_driver::Callbacks;
+use mcc::diagnostics::Diagnostics;
+
+struct DiagCollector {
+    all_diags: Vec<Diagnostics>,
+}
+
+impl Callbacks for DiagCollector {
+    type Output = Vec<Diagnostics>;
+
+    fn after_parse<'db>(
+        &mut self,
+        _db: &'db dyn mcc::Db,
+        _source_file: mcc::SourceFile,
+        _ast: mcc::Ast<'db>,
+        diags: Vec<&Diagnostics>,
+    ) -> ControlFlow<Self::Output> {
+        self.all_diags.extend(diags.into_iter().cloned());
+        ControlFlow::Continue(())
+    }
+
+    fn after_lower<'db>(
+        &mut self,
+        _db: &'db dyn mcc::Db,
+        _tacky: mcc::lowering::tacky::Program<'db>,
+        diags: Vec<&Diagnostics>,
+    ) -> ControlFlow<Self::Output> {
+        self.all_diags.extend(diags.into_iter().cloned());
+        ControlFlow::Continue(())
+    }
+
+    fn after_codegen<'db>(
+        &mut self,
+        _db: &'db dyn mcc::Db,
+        _asm: mcc::codegen::asm::Program<'db>,
+        diags: Vec<&Diagnostics>,
+    ) -> ControlFlow<Self::Output> {
+        self.all_diags.extend(diags.into_iter().cloned());
+        ControlFlow::Continue(())
+    }
+
+    fn after_render_assembly(
+        &mut self,
+        _db: &dyn mcc::Db,
+        _asm: mcc::Text,
+        diags: Vec<&Diagnostics>,
+    ) -> ControlFlow<Self::Output> {
+        self.all_diags.extend(diags.into_iter().cloned());
+        ControlFlow::Continue(())
+    }
+}
+```
+
+## Example: Write Assembly to File
+
+```rust
+use std::{fs, ops::ControlFlow, path::PathBuf};
+use mcc_driver::Callbacks;
+use mcc::Text;
+
+struct AsmWriter {
+    output_path: PathBuf,
+}
+
+impl Callbacks for AsmWriter {
+    type Output = ();
+
+    fn after_render_assembly(
+        &mut self,
+        _db: &dyn mcc::Db,
+        asm: Text,
+        _diags: Vec<&mcc::diagnostics::Diagnostics>,
+    ) -> ControlFlow<Self::Output> {
+        fs::write(&self.output_path, asm.as_str()).unwrap();
+        println!("Wrote assembly to {}", self.output_path.display());
+        // Stop after writing assembly
+        ControlFlow::Break(())
+    }
+}
+```
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Handle diagnostics at each stage">
+    Check for errors in diagnostics and handle them appropriately:
+    
+    ```rust
+    fn after_parse<'db>(
+        &mut self,
+        db: &'db dyn mcc::Db,
+        file: SourceFile,
+        ast: Ast<'db>,
+        diags: Vec<&Diagnostics>,
+    ) -> ControlFlow<Self::Output> {
+        if diags.iter().any(|d| d.severity == Severity::Error) {
+            // Stop on error
+            return ControlFlow::Break(ExitCode::FAILURE);
+        }
+        ControlFlow::Continue(())
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="Use EarlyReturn for custom workflows">
+    If you only need certain stages (e.g., parse + typecheck for a linter), use `ControlFlow::Break` to skip later stages:
+    
+    ```rust
+    fn after_lower<'db>(
+        &mut self,
+        _db: &'db dyn mcc::Db,
+        tacky: tacky::Program<'db>,
+        _diags: Vec<&Diagnostics>,
+    ) -> ControlFlow<Self::Output> {
+        // Analyze TAC, then stop
+        self.analyze(tacky);
+        ControlFlow::Break(self.result())
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="Implement only needed callbacks">
+    The trait provides default implementations for all methods. Override only what you need:
+    
+    ```rust
+    impl Callbacks for MyTool {
+        type Output = ();
+        
+        // Only implement after_codegen
+        fn after_codegen<'db>(
+            &mut self,
+            db: &'db dyn mcc::Db,
+            asm: asm::Program<'db>,
+            diags: Vec<&Diagnostics>,
+        ) -> ControlFlow<Self::Output> {
+            // Custom logic
+        }
+    }
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="API Overview" icon="book" href="/api/overview">
+    Learn about the core compilation API
+  </Card>
+  <Card title="Diagnostics" icon="triangle-exclamation" href="/api/diagnostics">
+    Handle errors collected in callbacks
+  </Card>
+  <Card title="Database" icon="database" href="/api/database">
+    Understand the compilation database
+  </Card>
+  <Card title="CLI" icon="terminal" href="/commands/compile">
+    See how the CLI uses callbacks internally
+  </Card>
+</CardGroup>

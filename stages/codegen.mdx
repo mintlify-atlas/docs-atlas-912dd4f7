@@ -1,0 +1,422 @@
+---
+title: "Code Generation"
+description: "TAC to assembly IR transformation with register allocation"
+---
+
+The code generation stage transforms Three-Address Code (TAC) into an assembly intermediate representation (IR), performing stack allocation and instruction selection.
+
+## Overview
+
+Codegen converts abstract TAC instructions into concrete x86-64 assembly instructions, allocating stack space for variables and temporaries.
+
+**Input:** `tacky::Program<'db>` (TAC IR)  
+**Output:** `asm::Program<'db>` (assembly IR)  
+**Modules:** `crates/mcc/src/codegen/mod.rs`, `crates/mcc/src/codegen/asm.rs`
+
+## Entry Point
+
+```rust
+#[salsa::tracked]
+pub fn generate_assembly<'db>(db: &'db dyn Db, program: tacky::Program<'db>) -> asm::Program<'db> {
+    let mut functions = Vec::new();
+    for function in program.functions(db) {
+        functions.push(lower_function(db, function));
+    }
+    asm::Program::new(db, functions)
+}
+```
+
+### Function Lowering Pipeline
+
+```rust
+#[salsa::tracked]
+fn lower_function<'db>(
+    db: &'db dyn Db,
+    function: tacky::FunctionDefinition<'db>,
+) -> asm::FunctionDefinition<'db> {
+    let asm = to_assembly(db, function);  // TAC → Assembly IR
+    fix_up_instructions(db, asm)          // Fix invalid instruction forms
+}
+```
+
+## Assembly IR
+
+Assembly IR is defined in `codegen/asm.rs`:
+
+### Program Structure
+
+```rust
+#[salsa::tracked]
+pub struct Program<'db> {
+    pub functions: Vec<FunctionDefinition<'db>>,
+}
+
+#[salsa::tracked]
+pub struct FunctionDefinition<'db> {
+    pub name: Text,
+    pub instructions: Vec<Instruction>,
+    pub span: Span,
+}
+```
+
+### Instructions
+
+```rust
+pub enum Instruction {
+    Mov { src: Operand, dst: Operand },
+    Unary { op: UnaryOperator, operand: Operand },
+    Binary { op: BinaryOperator, src: Operand, dst: Operand },
+    Idiv { src: Operand },              // Signed division
+    Cdq,                                 // Sign-extend EAX → EDX:EAX
+    AllocateStack(u32),                  // Reserve stack space
+    Ret,                                 // Return from function
+    Label(Text),                         // Jump target
+    Jump { target: Text },               // Unconditional jump
+    JumpIfZero { condition: Operand, target: Text },
+    JumpIfNotZero { condition: Operand, target: Text },
+    Comparison { op: ComparisonOperator, left: Operand, right: Operand, dst: Operand },
+}
+```
+
+### Operands
+
+```rust
+pub enum Operand {
+    Imm(i32),           // Immediate constant
+    Register(Register), // Hardware register
+    Stack(u32),         // Stack offset from %rbp
+}
+
+pub enum Register {
+    AX,   // %eax (accumulator, return value)
+    DX,   // %edx (used for division remainder)
+    R10,  // %r10d (general-purpose scratch register)
+}
+```
+
+### Operators
+
+```rust
+pub enum UnaryOperator {
+    Neg,         // negl
+    Complement,  // notl
+    Not,         // logical NOT (implemented as cmpl + sete)
+}
+
+pub enum BinaryOperator {
+    Add, Sub, Mul,              // Arithmetic
+    And, Or,                    // Bitwise
+    LeftShift, RightShift,      // Shifts
+}
+
+pub enum ComparisonOperator {
+    Equal, NotEqual,
+    LessThan, LessThanOrEqual,
+    GreaterThan, GreaterThanOrEqual,
+}
+```
+
+## Stack Allocation
+
+Variables and temporaries are allocated on the stack:
+
+```rust
+struct StackAllocator {
+    variables: Vec<tacky::Variable>,
+}
+
+impl StackAllocator {
+    fn operand_for(&mut self, val: tacky::Val) -> asm::Operand {
+        match val {
+            tacky::Val::Constant(c) => asm::Operand::Imm(c),
+            tacky::Val::Var(v) => asm::Operand::Stack(self.offset_for(v)),
+        }
+    }
+    
+    fn offset_for(&mut self, variable: tacky::Variable) -> u32 {
+        (self.index_of(variable) as u32) * 4  // 4-byte slots
+    }
+    
+    fn index_of(&mut self, variable: tacky::Variable) -> usize {
+        match self.variables.iter().position(|v| v == &variable) {
+            Some(i) => i,
+            None => {
+                let index = self.variables.len();
+                self.variables.push(variable);
+                index
+            }
+        }
+    }
+}
+```
+
+Each variable gets a 4-byte stack slot, allocated lazily on first use.
+
+## Instruction Selection
+
+### Return
+
+```rust
+tacky::Instruction::Return(ret) => {
+    let src = stack_locations.operand_for(ret);
+    instructions.push(asm::Instruction::Mov {
+        src,
+        dst: asm::Operand::Register(asm::Register::AX),
+    });
+    instructions.push(asm::Instruction::Ret);
+}
+```
+
+Return values are moved to `%eax` (x86-64 convention).
+
+### Unary Operations
+
+```rust
+tacky::Instruction::Unary { op, src, dst } => {
+    let op = unary_operator_to_asm(op);
+    let src = stack_locations.operand_for(src);
+    let dst = stack_locations.operand_for(dst);
+    
+    instructions.push(asm::Instruction::Mov { src, dst });
+    instructions.push(asm::Instruction::Unary { op, operand: dst });
+}
+```
+
+Unary ops modify in-place: copy source to destination, then apply operator.
+
+### Binary Operations
+
+Most binary operations:
+
+```rust
+tacky::Instruction::Binary { op, left_src, right_src, dst } => {
+    let left_src = stack_locations.operand_for(left_src);
+    let right_src = stack_locations.operand_for(right_src);
+    let dst = stack_locations.operand_for(dst);
+    
+    instructions.push(asm::Instruction::Mov {
+        src: left_src,
+        dst: asm::Operand::Register(asm::Register::R10),
+    });
+    instructions.push(asm::Instruction::Binary {
+        op,
+        src: right_src,
+        dst: asm::Operand::Register(asm::Register::R10),
+    });
+    instructions.push(asm::Instruction::Mov {
+        src: asm::Operand::Register(asm::Register::R10),
+        dst,
+    });
+}
+```
+
+Uses `%r10d` as scratch register to avoid memory-to-memory operations.
+
+### Division and Modulo
+
+Division uses special hardware requirements:
+
+```rust
+match op {
+    tacky::BinaryOperator::Div => {
+        instructions.push(asm::Instruction::Mov {
+            src: left_src,
+            dst: asm::Operand::Register(asm::Register::AX),
+        });
+        instructions.push(asm::Instruction::Cdq);  // Sign-extend EAX → EDX:EAX
+        instructions.push(asm::Instruction::Idiv { src: right_src });
+        instructions.push(asm::Instruction::Mov {
+            src: asm::Operand::Register(asm::Register::AX),  // Quotient
+            dst,
+        });
+    }
+    tacky::BinaryOperator::Mod => {
+        // Same setup, but result is in DX (EDX)
+        instructions.push(asm::Instruction::Mov {
+            src: asm::Operand::Register(asm::Register::DX),  // Remainder
+            dst,
+        });
+    }
+}
+```
+
+**`idiv` behavior:**
+- Divides `EDX:EAX` (64-bit) by operand
+- Quotient → `EAX`
+- Remainder → `EDX`
+
+### Comparisons
+
+```rust
+tacky::Instruction::Comparison { op, left_src, right_src, dst } => {
+    let left_src = stack_locations.operand_for(left_src);
+    let right_src = stack_locations.operand_for(right_src);
+    let dst = stack_locations.operand_for(dst);
+    
+    instructions.push(asm::Instruction::Comparison {
+        op: comparison_op,
+        left: left_src,
+        right: right_src,
+        dst,
+    });
+}
+```
+
+Comparisons emit `cmpl` + `setcc` sequences (handled during rendering).
+
+### Control Flow
+
+```rust
+tacky::Instruction::Jump { target } => {
+    instructions.push(asm::Instruction::Jump { target });
+}
+
+tacky::Instruction::JumpIfZero { condition, target } => {
+    let condition = stack_locations.operand_for(condition);
+    instructions.push(asm::Instruction::JumpIfZero { condition, target });
+}
+
+tacky::Instruction::Label(target) => {
+    instructions.push(asm::Instruction::Label(target));
+}
+```
+
+Control flow instructions map directly.
+
+## Stack Frame Setup
+
+After lowering all instructions, allocate stack space:
+
+```rust
+let stack_size_bytes = (stack_locations.variables.len() as u32) * 4;
+if stack_size_bytes > 0 {
+    instructions.insert(0, asm::Instruction::AllocateStack(stack_size_bytes));
+}
+```
+
+This becomes `subq $N, %rsp` during rendering.
+
+## Instruction Fix-Up
+
+Some instruction forms are invalid x86-64 and need rewriting:
+
+### Memory-to-Memory Moves
+
+```rust
+fn fix_up_instructions<'db>(
+    db: &'db dyn Db,
+    function: asm::FunctionDefinition<'db>,
+) -> asm::FunctionDefinition<'db> {
+    for instruction in function.instructions(db) {
+        match instruction {
+            asm::Instruction::Mov {
+                src: src @ asm::Operand::Stack(_),
+                dst: dst @ asm::Operand::Stack(_),
+            } => {
+                // Invalid: movl -4(%rbp), -8(%rbp)
+                // Fix: movl -4(%rbp), %r10d; movl %r10d, -8(%rbp)
+                instructions.push(asm::Instruction::Mov {
+                    src,
+                    dst: asm::Operand::Register(asm::Register::R10),
+                });
+                instructions.push(asm::Instruction::Mov {
+                    src: asm::Operand::Register(asm::Register::R10),
+                    dst,
+                });
+            }
+            // ...
+        }
+    }
+}
+```
+
+### Division with Immediate
+
+```rust
+asm::Instruction::Idiv { src: src @ asm::Operand::Imm(_) } => {
+    // Invalid: idivl $5
+    // Fix: movl $5, %r10d; idivl %r10d
+    instructions.push(asm::Instruction::Mov {
+        src,
+        dst: asm::Operand::Register(asm::Register::R10),
+    });
+    instructions.push(asm::Instruction::Idiv {
+        src: asm::Operand::Register(asm::Register::R10),
+    });
+}
+```
+
+### Comparison Edge Cases
+
+```rust
+// Both immediates: invalid
+asm::Instruction::Comparison {
+    op,
+    left: left @ asm::Operand::Imm(_),
+    right: right @ asm::Operand::Imm(_),
+    dst,
+} => {
+    instructions.push(asm::Instruction::Mov {
+        src: left,
+        dst: asm::Operand::Register(asm::Register::R10),
+    });
+    instructions.push(asm::Instruction::Comparison {
+        op,
+        left: asm::Operand::Register(asm::Register::R10),
+        right,
+        dst,
+    });
+}
+
+// Stack left + immediate right: invalid
+asm::Instruction::Comparison {
+    op,
+    left: left @ asm::Operand::Stack(_),
+    right: right @ asm::Operand::Imm(_),
+    dst,
+} => {
+    instructions.push(asm::Instruction::Mov {
+        src: left,
+        dst: asm::Operand::Register(asm::Register::R10),
+    });
+    instructions.push(asm::Instruction::Comparison {
+        op,
+        left: asm::Operand::Register(asm::Register::R10),
+        right,
+        dst,
+    });
+}
+```
+
+## Example
+
+**TAC Input:**
+```
+main:
+  Copy src=Constant(5), dst=Var(Named("x"))
+  Binary op=Add, left_src=Var(Named("x")), right_src=Constant(3), dst=Var(Anonymous(0))
+  Copy src=Var(Anonymous(0)), dst=Var(Named("y"))
+  Return Var(Named("y"))
+```
+
+**Assembly IR Output:**
+```
+main:
+  AllocateStack(8)           // 2 variables × 4 bytes
+  Mov { src=Imm(5), dst=Stack(0) }
+  Mov { src=Stack(0), dst=Register(R10) }
+  Binary { op=Add, src=Imm(3), dst=Register(R10) }
+  Mov { src=Register(R10), dst=Stack(4) }
+  Mov { src=Stack(4), dst=Register(R10) }
+  Mov { src=Register(R10), dst=Stack(8) }
+  Mov { src=Stack(8), dst=Register(AX) }
+  Ret
+```
+
+Note: Fix-up pass inserts additional moves to avoid invalid forms.
+
+## Related Stages
+
+- **Previous:** [Lowering](/stages/lowering) – Produces TAC input
+- **Next:** [Assembly Rendering](/stages/assembly) – Converts IR to text
+- **Assembly IR Definition:** `crates/mcc/src/codegen/asm.rs`

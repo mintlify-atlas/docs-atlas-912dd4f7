@@ -1,0 +1,493 @@
+---
+title: Compilation pipeline
+description: Understand the seven stages of MCC's compilation pipeline and how data flows between them
+---
+
+MCC transforms C source code into executable machine code through seven well-defined stages. Each stage consumes the output of the previous stage and is implemented as a Salsa tracked function.
+
+## Pipeline overview
+
+The compilation follows a linear pipeline:
+
+```mermaid
+graph LR
+    A[Source File] --> B[Preprocessing]
+    B --> C[Parsing]
+    C --> D[Typechecking]
+    D --> E[Lowering]
+    E --> F[Codegen]
+    F --> G[Rendering]
+    G --> H[Assembling]
+    H --> I[Executable]
+```
+
+Each stage is cached by Salsa, enabling incremental compilation when source files haven't changed.
+
+## Stage 1: Preprocessing
+
+Runs the system C preprocessor to handle `#include`, `#define`, and other directives.
+
+### Implementation
+
+```rust
+// crates/mcc/src/preprocessing.rs:12
+#[salsa::tracked]
+pub fn preprocess(db: &dyn Db, cc: OsString, src: SourceFile) 
+    -> Result<Text, PreprocessorError>
+```
+
+### What it does
+
+- Invokes the system C compiler with `-E -P` flags
+- Expands macros and includes
+- Removes comments and directives
+- Returns preprocessed source as `Text`
+
+<CodeGroup>
+```rust Input
+SourceFile {
+    path: "main.c",
+    contents: "#define X 42\nint main() { return X; }"
+}
+```
+
+```rust Output
+Text("int main() { return 42; }")
+```
+</CodeGroup>
+
+<Note>
+  The `mcc-driver` currently runs preprocessing and writes the result to a temporary file. The parser reads the original `SourceFile` contents.
+</Note>
+
+## Stage 2: Parsing
+
+Transforms source text into a strongly-typed Abstract Syntax Tree (AST) using tree-sitter.
+
+### Implementation
+
+```rust
+// crates/mcc/src/parsing.rs:15
+#[salsa::tracked]
+pub fn parse(db: &dyn Db, file: SourceFile) -> Ast<'_>
+```
+
+### What it does
+
+- Invokes tree-sitter's C grammar parser
+- Wraps the parse tree in strongly-typed AST nodes from `mcc-syntax`
+- Accumulates syntax error diagnostics
+- Returns an `Ast` even if errors are present (error recovery)
+
+<Tabs>
+  <Tab title="Input">
+    ```c
+    int main(void) { return 0; }
+    ```
+  </Tab>
+  <Tab title="Output">
+    ```rust
+    Ast {
+        tree: Tree {
+            root: TranslationUnit {
+                children: [
+                    FunctionDefinition {
+                        type: "int",
+                        declarator: "main",
+                        body: CompoundStatement { ... }
+                    }
+                ]
+            }
+        }
+    }
+    ```
+  </Tab>
+</Tabs>
+
+### Error recovery
+
+Tree-sitter provides error recovery, allowing parsing to continue even when syntax errors are present:
+
+```rust
+// crates/mcc/src/parsing.rs:51
+fn check_node(db: &dyn Db, node: TsNode<'_>, file: SourceFile) -> Continuation {
+    if node.is_missing() {
+        Diagnostic::error()
+            .with_message(format!("Expected a \"{}\"", 
+                node.parent().unwrap().grammar_name()))
+            .accumulate(db);
+    }
+    // ... continue parsing
+}
+```
+
+## Stage 3: Typechecking (HIR)
+
+Builds the High-Level Intermediate Representation (HIR) from the AST. Semantic errors are surfaced here.
+
+### Implementation
+
+```rust
+// crates/mcc/src/typechecking/mod.rs:23
+#[salsa::tracked]
+pub fn typecheck(db: &dyn Db, file: SourceFile) -> hir::TranslationUnit<'_>
+```
+
+### What it does
+
+- Validates return types (`int`, `void`)
+- Checks for C keywords used as identifiers
+- Validates type specifiers in declarations
+- Builds HIR representation with resolved names
+
+<Accordion title="HIR data structures">
+```rust
+// crates/mcc/src/typechecking/hir.rs:14
+#[salsa::tracked(debug)]
+pub struct TranslationUnit<'db> {
+    pub items: Vec<Item<'db>>,
+    pub file: SourceFile,
+}
+
+#[derive(Debug, Copy, Clone)]
+pub enum Item<'db> {
+    Function(FunctionDefinition<'db>),
+}
+
+#[salsa::tracked(debug)]
+pub struct FunctionDefinition<'db> {
+    pub name: Identifier<'db>,
+    pub node: ptr::FunctionDefinition<'db>,
+}
+
+#[derive(Debug, Copy, Clone)]
+pub enum Type {
+    Void,
+    Int,
+    Error,
+}
+```
+</Accordion>
+
+### Validation examples
+
+<CodeGroup>
+```c Invalid type
+ints main(void) { return 0; }
+// Error: invalid type "ints"
+```
+
+```c Keyword as identifier
+int main(void) { 
+    int return = 4;
+    // Error: "return" is a keyword
+}
+```
+
+```c Missing return type
+main(void) { return 0; }
+// Error: Expected a return type
+```
+</CodeGroup>
+
+## Stage 4: Lowering (TAC)
+
+Transforms HIR into Three Address Code (TAC), a simplified intermediate representation.
+
+### Implementation
+
+```rust
+// crates/mcc/src/lowering/mod.rs:716
+#[salsa::tracked]
+pub fn lower_program(db: &dyn Db, file: SourceFile) -> tacky::Program<'_>
+```
+
+### What it does
+
+- Converts HIR to TAC instructions
+- Breaks complex expressions into simple operations
+- Generates temporary variables
+- Implements control flow (jumps, labels)
+- Validates variable declarations (undeclared, redefinition)
+
+<Tabs>
+  <Tab title="C Code">
+    ```c
+    int main(void) {
+        int a = 2 + 3;
+        return a * 4;
+    }
+    ```
+  </Tab>
+  <Tab title="TAC Instructions">
+    ```rust
+    [
+        Binary { op: Add, left: Constant(2), right: Constant(3), dst: Var("a") },
+        Binary { op: Mul, left: Var("a"), right: Constant(4), dst: Anonymous(0) },
+        Return(Anonymous(0)),
+    ]
+    ```
+  </Tab>
+</Tabs>
+
+### TAC instruction types
+
+```rust
+pub enum Instruction {
+    Return(Val),
+    Unary { op: UnaryOperator, src: Val, dst: Val },
+    Binary { op: BinaryOperator, left_src: Val, right_src: Val, dst: Val },
+    Comparison { op: ComparisonOperator, left_src: Val, right_src: Val, dst: Val },
+    Copy { src: Val, dst: Val },
+    Jump { target: Text },
+    JumpIfZero { condition: Val, target: Text },
+    JumpIfNotZero { condition: Val, target: Text },
+    Label(Text),
+}
+```
+
+### Short-circuit evaluation
+
+Logical operators implement short-circuit semantics:
+
+```rust
+// crates/mcc/src/lowering/mod.rs:532
+fn lower_logical_and(
+    &mut self,
+    left: ast::Expression<'_>,
+    right: ast::Expression<'_>,
+) -> Option<tacky::Val> {
+    let left_val = self.lower_expression(left)?;
+    let false_label = self.label();
+    
+    // If left is zero, jump to false case
+    self.instructions.push(tacky::Instruction::JumpIfZero {
+        condition: left_val,
+        target: false_label.clone(),
+    });
+    
+    // Otherwise evaluate right
+    let right_val = self.lower_expression(right)?;
+    // ...
+}
+```
+
+## Stage 5: Code generation (ASM IR)
+
+Lowers TAC to a target-agnostic assembly intermediate representation.
+
+### Implementation
+
+```rust
+// crates/mcc/src/codegen/mod.rs:10
+#[salsa::tracked]
+pub fn generate_assembly(db: &dyn Db, program: tacky::Program<'_>) 
+    -> asm::Program<'_>
+```
+
+### What it does
+
+- Converts TAC instructions to assembly operations
+- Allocates stack space for local variables
+- Maps TAC values to operands (immediate, register, stack)
+- Fixes up invalid instruction combinations
+
+<Accordion title="Stack allocation">
+```rust
+// crates/mcc/src/codegen/mod.rs:210
+impl StackAllocator {
+    fn operand_for(&mut self, val: tacky::Val) -> asm::Operand {
+        match val {
+            tacky::Val::Constant(c) => asm::Operand::Imm(c),
+            tacky::Val::Var(v) => asm::Operand::Stack(self.offset_for(v)),
+        }
+    }
+    
+    fn offset_for(&mut self, variable: tacky::Variable) -> u32 {
+        (self.index_of(variable) as u32) * 4  // 4 bytes per slot
+    }
+}
+```
+</Accordion>
+
+### Assembly IR types
+
+```rust
+pub enum Instruction {
+    Mov { src: Operand, dst: Operand },
+    Unary { op: UnaryOperator, operand: Operand },
+    Binary { op: BinaryOperator, src: Operand, dst: Operand },
+    Comparison { op: ComparisonOperator, left: Operand, right: Operand, dst: Operand },
+    Idiv { src: Operand },
+    Cdq,
+    AllocateStack(u32),
+    Ret,
+    Label(Text),
+    Jump { target: Text },
+    JumpIfZero { condition: Operand, target: Text },
+    JumpIfNotZero { condition: Operand, target: Text },
+}
+
+pub enum Operand {
+    Imm(i32),
+    Register(Register),
+    Stack(u32),
+}
+```
+
+### Instruction fixups
+
+Fixes invalid instruction patterns:
+
+```rust
+// crates/mcc/src/codegen/mod.rs:247
+#[salsa::tracked]
+fn fix_up_instructions(db: &dyn Db, function: asm::FunctionDefinition<'_>) 
+    -> asm::FunctionDefinition<'_> {
+    match instruction {
+        // mov from stack to stack is invalid
+        Mov { src: Stack(_), dst: Stack(_) } => {
+            instructions.push(Mov { src, dst: Register(R10) });
+            instructions.push(Mov { src: Register(R10), dst });
+        }
+        // idiv doesn't accept immediates
+        Idiv { src: Imm(_) } => {
+            instructions.push(Mov { src, dst: Register(R10) });
+            instructions.push(Idiv { src: Register(R10) });
+        }
+        // ...
+    }
+}
+```
+
+## Stage 6: Rendering (assembly text)
+
+Renders the assembly IR to textual x86_64 assembly with OS-specific conventions.
+
+### Implementation
+
+```rust
+// crates/mcc/src/render.rs:13
+#[salsa::tracked]
+pub fn render_program(db: &dyn Db, program: asm::Program<'_>, target: Triple) 
+    -> Text
+```
+
+### What it does
+
+- Converts assembly IR to AT&T syntax
+- Applies macOS symbol prefixes (leading underscore)
+- Emits GNU stack note on Linux
+- Generates function prologues and epilogues
+
+<Tabs>
+  <Tab title="macOS">
+    ```asm
+    .globl _main
+    _main:
+    pushq %rbp
+    movq %rsp, %rbp
+    movl $0, %eax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    ```
+  </Tab>
+  <Tab title="Linux">
+    ```asm
+    .globl main
+    main:
+    pushq %rbp
+    movq %rsp, %rbp
+    movl $0, %eax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    
+    .section .note.GNU-stack, "", @progbits
+    ```
+  </Tab>
+</Tabs>
+
+### OS-specific rendering
+
+```rust
+// crates/mcc/src/render.rs:46
+fn function_name<'a>(&self, name: &'a str) -> Cow<'a, str> {
+    if matches!(
+        self.target.operating_system,
+        OperatingSystem::MacOSX(_) | OperatingSystem::Darwin(_)
+    ) {
+        format!("_{name}").into()  // macOS: _main
+    } else {
+        name.into()                // Linux: main
+    }
+}
+```
+
+## Stage 7: Assembling
+
+Invokes the system compiler to assemble the emitted assembly file into an executable.
+
+### Implementation
+
+```rust
+// crates/mcc/src/assembling.rs:10
+#[salsa::tracked]
+pub fn assemble_and_link(
+    _db: &dyn Db,
+    cc: OsString,
+    assembly: PathBuf,
+    dest: PathBuf,
+    target: Triple,
+) -> Result<(), CommandError>
+```
+
+### What it does
+
+- Invokes system compiler (e.g., `cc` or `gcc`)
+- Passes target architecture flags
+- Links standard libraries
+- Produces final executable
+
+```rust
+// crates/mcc/src/assembling.rs:17
+let mut cmd = Command::new(cc);
+cmd.arg("-o").arg(dest);
+
+if matches!(target.operating_system, OperatingSystem::Darwin(_)) {
+    cmd.arg("-arch").arg(target.architecture.to_string());
+}
+
+cmd.arg(assembly);
+```
+
+## Data flow summary
+
+<Steps>
+  <Step title="Source → Preprocessed Text">
+    `SourceFile` → `preprocess()` → `Text`
+  </Step>
+  <Step title="Text → AST">
+    `SourceFile` → `parse()` → `Ast`
+  </Step>
+  <Step title="AST → HIR">
+    `SourceFile` → `typecheck()` → `hir::TranslationUnit`
+  </Step>
+  <Step title="HIR → TAC">
+    `SourceFile` → `lower_program()` → `tacky::Program`
+  </Step>
+  <Step title="TAC → ASM IR">
+    `tacky::Program` → `generate_assembly()` → `asm::Program`
+  </Step>
+  <Step title="ASM IR → Assembly Text">
+    `asm::Program` → `render_program()` → `Text`
+  </Step>
+  <Step title="Assembly Text → Executable">
+    `PathBuf` → `assemble_and_link()` → `Executable`
+  </Step>
+</Steps>
+
+<Info>
+  Each stage is a Salsa tracked function, enabling incremental recompilation. See [Incremental compilation](/concepts/incremental-compilation) for details.
+</Info>

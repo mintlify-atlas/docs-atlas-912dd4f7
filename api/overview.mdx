@@ -1,0 +1,247 @@
+---
+title: API Overview
+description: Embed the MCC compiler in your Rust applications
+---
+
+The `mcc` crate provides a library API for embedding the C compiler in tools, tests, and other applications. It exposes a pipeline-based architecture with incremental recomputation powered by [Salsa](https://github.com/salsa-rs/salsa).
+
+## Quick Start
+
+Parse, typecheck, lower, generate, and render a C program to assembly text:
+
+```rust
+use mcc::{Database, SourceFile, Text};
+
+let db = Database::default();
+let src = "int main(void) { return 0; }";
+let file = SourceFile::new(&db, Text::from("main.c"), Text::from(src));
+
+// Parse → typecheck → TAC → ASM IR → assembly text
+let ast = mcc::parse(&db, file);
+let tacky = mcc::lowering::lower_program(&db, file);
+let asm_ir = mcc::codegen::generate_assembly(&db, tacky);
+let asm_text = mcc::render_program(&db, asm_ir, mcc::default_target()).unwrap();
+
+assert!(asm_text.as_str().contains("main"));
+```
+
+## Compilation Pipeline
+
+The compiler follows a classic multi-stage pipeline:
+
+<Steps>
+  <Step title="Preprocessing">
+    [`preprocess`](/api/overview#preprocessing) invokes the system C preprocessor (`cc -E -P`)
+  </Step>
+  <Step title="Parsing">
+    [`parse`](/api/overview#parsing) produces an abstract syntax tree ([`Ast`](/api/overview#ast))
+  </Step>
+  <Step title="Typechecking">
+    [`typechecking::typecheck`](/api/overview#typechecking) validates types and builds HIR
+  </Step>
+  <Step title="Lowering">
+    [`lowering::lower_program`](/api/overview#lowering) converts AST to three-address code (TAC)
+  </Step>
+  <Step title="Code Generation">
+    [`codegen::generate_assembly`](/api/overview#codegen) produces assembly IR
+  </Step>
+  <Step title="Rendering">
+    [`render_program`](/api/overview#rendering) converts assembly IR to text
+  </Step>
+  <Step title="Assembling & Linking">
+    [`assemble_and_link`](/api/overview#assembling) invokes the system toolchain
+  </Step>
+</Steps>
+
+## Core Types
+
+### Database
+
+```rust
+pub struct Database {
+    storage: salsa::Storage<Self>,
+}
+```
+
+The incremental computation database. Create with `Database::default()` and pass by reference to all pipeline functions.
+
+### SourceFile
+
+```rust
+#[salsa::input]
+pub struct SourceFile {
+    pub path: Text,
+    pub contents: Text,
+}
+```
+
+Represents a source file. Create with:
+
+```rust
+let file = SourceFile::new(&db, Text::from("main.c"), Text::from(src));
+```
+
+### Ast
+
+```rust
+#[salsa::tracked]
+pub struct Ast<'db> {
+    pub tree: Tree,
+}
+```
+
+The abstract syntax tree produced by parsing. Access the root node:
+
+```rust
+let ast = mcc::parse(&db, file);
+let root = ast.root(&db); // ast::TranslationUnit<'_>
+```
+
+### Text
+
+```rust
+pub struct Text(Arc<str>);
+```
+
+A reference-counted string type. Converts from `&str`, `String`, and `Cow<'_, str>`.
+
+## Capturing Diagnostics
+
+Each stage accumulates diagnostics rather than panicking. Retrieve them using the stage's `accumulated` helper:
+
+```rust
+use mcc::{Database, SourceFile, Text, diagnostics::Diagnostics};
+
+let db = Database::default();
+let file = SourceFile::new(&db, "test.c".into(), "int main(void) {}".into());
+let _ = mcc::parse(&db, file);
+let diags: Vec<&Diagnostics> = mcc::parse::accumulated::<Diagnostics>(&db, file);
+
+// Render with codespan-reporting using `mcc::Files`
+use codespan_reporting::term;
+use codespan_reporting::term::termcolor::{ColorChoice, StandardStream};
+
+let mut files = mcc::Files::new();
+files.add(&db, file);
+
+let writer = StandardStream::stderr(ColorChoice::Auto);
+let config = term::Config::default();
+
+for diag in diags {
+    term::emit(&mut writer.lock(), &config, &files, &**diag).unwrap();
+}
+```
+
+See [Diagnostics](/api/diagnostics) for details.
+
+## Target Configuration
+
+Rendering assembly requires a target triple:
+
+```rust
+use target_lexicon::Triple;
+
+let target = mcc::default_target(); // x86_64 for current host OS
+let asm_text = mcc::render_program(&db, asm_ir, target)?;
+```
+
+### Platform-Specific Behavior
+
+- **macOS**: Symbol names are rendered with a leading underscore (e.g., `_main`)
+- **Linux**: A `.note.GNU-stack` section is emitted for stack protection
+
+## Pipeline Functions
+
+### Preprocessing
+
+```rust
+pub fn preprocess(
+    db: &dyn Db,
+    cc: OsString,
+    file: SourceFile,
+) -> Result<String, CommandError>
+```
+
+Invokes the system C preprocessor. The `cc` argument is typically `"cc"` or `"gcc"`.
+
+### Parsing
+
+```rust
+pub fn parse(db: &dyn Db, file: SourceFile) -> Ast<'_>
+```
+
+Parses source code into an abstract syntax tree using tree-sitter.
+
+### Typechecking
+
+```rust
+pub mod typechecking {
+    pub fn typecheck(db: &dyn Db, file: SourceFile) -> Hir<'_>;
+}
+```
+
+Validates types and builds a high-level intermediate representation.
+
+### Lowering
+
+```rust
+pub mod lowering {
+    pub fn lower_program(db: &dyn Db, file: SourceFile) -> tacky::Program<'_>;
+    pub fn lower(db: &dyn Db, ast: Ast<'_>) -> tacky::Program<'_>;
+}
+```
+
+Converts the AST to three-address code (TAC).
+
+### Codegen
+
+```rust
+pub mod codegen {
+    pub fn generate_assembly(db: &dyn Db, tacky: tacky::Program<'_>) -> asm::Program<'_>;
+}
+```
+
+Generates assembly IR from TAC.
+
+### Rendering
+
+```rust
+pub fn render_program(
+    db: &dyn Db,
+    program: asm::Program<'_>,
+    target: Triple,
+) -> Text
+```
+
+Converts assembly IR to textual assembly code.
+
+### Assembling
+
+```rust
+pub fn assemble_and_link(
+    db: &dyn Db,
+    cc: OsString,
+    assembly: PathBuf,
+    output: PathBuf,
+    target: Triple,
+) -> Result<(), CommandError>
+```
+
+Invokes the system assembler and linker to produce an executable.
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Database" icon="database" href="/api/database">
+    Learn about the Salsa-powered incremental computation layer
+  </Card>
+  <Card title="Diagnostics" icon="triangle-exclamation" href="/api/diagnostics">
+    Handle errors and warnings with codespan-reporting
+  </Card>
+  <Card title="Callbacks" icon="webhook" href="/api/callbacks">
+    Hook into compilation stages with the driver API
+  </Card>
+  <Card title="Architecture" icon="sitemap" href="/concepts/architecture">
+    Understand the overall system design
+  </Card>
+</CardGroup>

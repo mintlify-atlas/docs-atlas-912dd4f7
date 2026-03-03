@@ -1,0 +1,223 @@
+---
+title: Test Framework Overview
+description: Architecture and design of MCC's integration test framework
+---
+
+MCC includes a comprehensive test framework built on top of the [writing-a-c-compiler-tests](https://github.com/nlsandler/writing-a-c-compiler-tests) test suite. The framework provides dynamic test discovery, flexible configuration, and integration with Rust's testing ecosystem.
+
+## Architecture
+
+The test framework is located in the `integration-tests` crate and consists of several key components:
+
+### Test Discovery
+
+Tests are automatically discovered by scanning the `writing-a-c-compiler-tests/tests/` directory structure:
+
+```rust
+use integration_tests::{discover, ExpectedResults};
+
+let test_root = Path::new("writing-a-c-compiler-tests");
+let expected_results: ExpectedResults = 
+    serde_json::from_str(EXPECTED_RESULTS)?;
+
+let test_cases = discover(&test_root, &expected_results)?;
+```
+
+The discovery process:
+
+1. Scans chapter directories: `chapter_1/`, `chapter_2/`, etc.
+2. Within each chapter, scans test kind subdirectories:
+   - `valid/` - Tests that should compile and run successfully
+   - `invalid_parse/` - Tests that should fail during lexing or parsing
+   - `invalid_tacky/` - Tests that should fail during lowering to TACKY IR
+   - `invalid_semantics/` - Tests that should fail during semantic analysis
+   - `invalid_codegen/` - Tests that should fail during code generation
+3. Discovers all `.c` files within each kind directory
+4. Generates test names in the format: `chapter_{n}::{kind}::{filename}`
+
+### Test Case Structure
+
+Each test case is represented by the `TestCase` struct:
+
+```rust
+pub struct TestCase {
+    pub chapter: u32,
+    pub kind: Kind,
+    pub path: PathBuf,
+    pub name: String,
+    pub expected: Option<TestResult>,
+}
+```
+
+The `Kind` enum distinguishes between valid and invalid tests:
+
+```rust
+pub enum Kind {
+    Valid,
+    Invalid(String),  // String indicates the stage (parse, tacky, etc.)
+}
+```
+
+### Expected Results
+
+Expected test results are loaded from `expected_results.json` in the test suite:
+
+```rust
+pub struct TestResult {
+    pub return_code: i32,
+    pub stdout: Option<String>,
+}
+```
+
+For valid tests, the framework verifies:
+- The program compiles successfully
+- The executable returns the expected exit code
+- Standard output matches the expected output (if specified)
+
+For invalid tests, the framework verifies:
+- Compilation fails at the expected stage
+- Diagnostics are emitted appropriately
+
+## Integration with libtest-mimic
+
+The test framework uses [libtest-mimic](https://docs.rs/libtest-mimic/) to provide a familiar Rust test runner interface. Each `TestCase` can be converted into a libtest-mimic `Trial`:
+
+```rust
+impl TestCase {
+    pub fn trial(self) -> Trial {
+        Trial::test(name, move || {
+            // Test execution logic
+        })
+    }
+}
+```
+
+This integration provides:
+- Standard test filtering and selection
+- Parallel test execution
+- Familiar output formatting
+- Support for ignored tests
+
+## Test Execution
+
+### Callbacks Trait
+
+Test execution leverages the `mcc_driver::Callbacks` trait to intercept compilation at various stages:
+
+```rust
+impl mcc_driver::Callbacks for Callbacks {
+    type Output = Result<(), Error>;
+
+    fn after_parse(
+        &mut self,
+        _db: &dyn mcc::Db,
+        _source_file: mcc::SourceFile,
+        _ast: mcc::Ast,
+        diags: Vec<&Diagnostics>,
+    ) -> ControlFlow<Result<(), Error>> {
+        self.handle_diags(&["lex", "parse"], diags)
+    }
+
+    fn after_lower(
+        &mut self,
+        _db: &dyn mcc::Db,
+        _tacky: mcc::lowering::tacky::Program,
+        diags: Vec<&Diagnostics>,
+    ) -> ControlFlow<Result<(), Error>> {
+        self.handle_diags(&["tacky", "semantics"], diags)
+    }
+
+    fn after_codegen(
+        &mut self,
+        _db: &dyn mcc::Db,
+        _asm: mcc::codegen::asm::Program,
+        diags: Vec<&Diagnostics>,
+    ) -> ControlFlow<Result<(), Error>> {
+        self.handle_diags(&["codegen"], diags)
+    }
+
+    fn after_compile(
+        &mut self,
+        _db: &dyn mcc::Db,
+        binary: PathBuf,
+    ) -> ControlFlow<Self::Output> {
+        // Execute binary and verify results
+    }
+}
+```
+
+The callbacks allow the framework to:
+- Detect errors at specific compilation stages
+- Verify that invalid tests fail at the expected stage
+- Execute compiled binaries and verify output
+- Return early with success/failure without completing the full pipeline
+
+### Compilation Pipeline
+
+The test framework runs the full MCC compilation pipeline:
+
+1. **Preprocessing** - Run system C preprocessor via `cc -E -P`
+2. **Parsing** - Tree-sitter-based parsing with error recovery
+3. **Lowering** - Transform AST to Three Address Code (TACKY IR)
+4. **Codegen** - Generate target-agnostic assembly IR
+5. **Rendering** - Render assembly IR to text with OS-specific conventions
+6. **Assembling** - Invoke system compiler to create executable
+7. **Execution** - Run binary and verify output (for valid tests)
+
+For invalid tests, execution stops at the expected failure stage.
+
+## Test Configuration
+
+The main test binary is configured via constants:
+
+```rust
+const MAX_CHAPTER: u32 = 6;  // Limit which chapters are tested
+const EXPECTED_RESULTS: &str = 
+    include_str!("../writing-a-c-compiler-tests/expected_results.json");
+```
+
+### Ignored Tests
+
+Tests can be marked as ignored for structural differences between MCC and the book:
+
+```rust
+let ignored = [
+    // Structural difference: we report these during type checking, not parsing
+    "chapter_1::invalid_parse::not_expression",
+    "chapter_1::invalid_parse::missing_type",
+    "chapter_3::invalid_parse::malformed_paren",
+    "chapter_5::invalid_parse::invalid_type",
+    "chapter_5::invalid_parse::declare_keyword_as_var",
+    "chapter_5::invalid_semantics::invalid_lvalue",
+];
+```
+
+<Note>
+Tests should only be ignored when MCC's design structurally differs from the book (e.g., reporting an error at type-check instead of parse). Do NOT ignore tests for unimplemented features—leave them failing until the feature is implemented.
+</Note>
+
+## Test Database
+
+Each test creates a fresh Salsa database:
+
+```rust
+let db = mcc::Database::default();
+let target = mcc::default_target();
+let source_file = SourceFile::new(&db, path_text, src.into());
+```
+
+This ensures:
+- Test isolation (no shared state between tests)
+- Clean incremental compilation cache per test
+- Predictable test behavior
+
+## Temporary Files
+
+The framework uses temporary directories for build artifacts:
+
+```rust
+let temp = tempfile::tempdir()?;
+let output_path = temp.path().join("output_bin");
+```
+
+Temporary files are automatically cleaned up after test execution.

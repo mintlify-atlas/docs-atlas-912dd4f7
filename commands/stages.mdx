@@ -1,0 +1,293 @@
+---
+title: "Compilation Stages"
+description: "Control which compilation stage to stop at for debugging and inspection"
+---
+
+## Overview
+
+The MCC compiler pipeline can be stopped at any intermediate stage using stage-specific flags. This is useful for:
+
+- Debugging compiler issues
+- Inspecting intermediate representations
+- Testing individual pipeline stages
+- Understanding the compilation process
+
+## Stage Flags
+
+All stage flags are mutually exclusive - you can only specify one at a time.
+
+### --lex
+
+```bash
+mcc --lex input.c
+```
+
+Stop after lexing (tokenization). The compiler will:
+
+1. Preprocess the input file
+2. Tokenize the source into a stream of tokens
+3. Stop and exit
+
+**Use cases:**
+- Debugging lexer issues
+- Verifying token recognition
+- Testing preprocessor integration
+
+**Example:**
+```bash
+$ mcc --lex hello.c
+# Exits after tokenization
+# No output files produced
+```
+
+### --parse
+
+```bash
+mcc --parse input.c
+```
+
+Stop after parsing. The compiler will:
+
+1. Preprocess and tokenize
+2. Parse tokens into an Abstract Syntax Tree (AST)
+3. Stop and exit
+
+**Use cases:**
+- Debugging parser issues
+- Verifying syntax correctness
+- Inspecting AST structure (with tracing enabled)
+
+**Example:**
+```bash
+$ mcc --parse hello.c
+# Exits after parsing
+# AST is built but not lowered
+```
+
+**With tracing:**
+```bash
+$ RUST_LOG=mcc_syntax=trace mcc --parse hello.c
+# Shows detailed AST construction
+```
+
+### --tacky
+
+```bash
+mcc --tacky input.c
+```
+
+Stop after lowering to TACKY (Three Address Code). The compiler will:
+
+1. Preprocess, tokenize, and parse
+2. Perform semantic analysis and type checking
+3. Lower the AST to Three Address Code intermediate representation
+4. Stop and exit
+
+**Use cases:**
+- Debugging semantic analysis
+- Inspecting the intermediate representation
+- Verifying lowering correctness
+- Testing optimization passes (if implemented)
+
+**Example:**
+```bash
+$ mcc --tacky factorial.c
+# Exits after TACKY generation
+# IR is generated but not converted to assembly
+```
+
+**What is TACKY?**
+
+TACKY (Three Address Code) is an intermediate representation where each instruction has at most three operands. It's easier to optimize and analyze than the AST.
+
+Example transformation:
+```c
+// Source C code
+int x = a + b * c;
+
+// TACKY IR (conceptual)
+t1 = b * c
+t2 = a + t1
+x = t2
+```
+
+### --codegen
+
+```bash
+mcc --codegen input.c
+```
+
+Stop after code generation. The compiler will:
+
+1. Complete all stages up through TACKY
+2. Generate assembly instructions from TACKY IR
+3. Stop before rendering assembly text
+4. Exit
+
+**Use cases:**
+- Debugging code generation
+- Inspecting assembly instruction structure
+- Testing register allocation
+- Verifying instruction selection
+
+**Example:**
+```bash
+$ mcc --codegen fibonacci.c
+# Exits after assembly generation
+# Assembly instructions created but not rendered to text
+```
+
+**Note:** This stops after generating the internal assembly representation but before converting it to textual assembly code. To see the assembly text, use the `-S` flag instead (see [Assembly Output](#assembly-output)).
+
+## Assembly Output
+
+### -S
+
+```bash
+mcc -S input.c
+```
+
+Generate assembly file and keep it after compilation. Unlike the stage flags, `-S` runs the full pipeline but preserves the assembly file.
+
+**Behavior:**
+1. Runs complete compilation pipeline
+2. Generates assembly text file (`.s` extension)
+3. Keeps the assembly file instead of deleting it
+4. Continues to assemble and link to produce executable
+
+**Output:** Creates `input.s` alongside the executable
+
+**Example:**
+```bash
+$ mcc -S hello.c
+$ ls
+hello  hello.c  hello.s
+
+$ cat hello.s
+	.text
+	.globl main
+main:
+	pushq	%rbp
+	movq	%rsp, %rbp
+	movl	$42, %eax
+	popq	%rbp
+	ret
+```
+
+**With custom output:**
+```bash
+mcc -S -o myprogram hello.c
+# Creates: myprogram (executable) and myprogram.s (assembly)
+```
+
+## Combining Stage Flags with Other Options
+
+Stage flags can be combined with other options:
+
+### With Output Specification
+
+```bash
+mcc --parse -o parsed_output main.c
+```
+
+The output flag is accepted but may not produce a file since parsing doesn't generate output artifacts.
+
+### With Color Control
+
+```bash
+mcc --codegen --color always program.c
+```
+
+Useful for capturing colorized diagnostics from intermediate stages.
+
+### With Target Specification
+
+```bash
+mcc --codegen --target x86_64-unknown-linux-gnu main.c
+```
+
+The target affects code generation, so specifying it with `--codegen` is meaningful.
+
+## Debugging with Stages
+
+### Narrow Down Compilation Errors
+
+If compilation fails, use stage flags to identify which stage is problematic:
+
+```bash
+# Check if parsing succeeds
+mcc --parse problem.c
+
+# Check if lowering succeeds
+mcc --tacky problem.c
+
+# Check if codegen succeeds
+mcc --codegen problem.c
+```
+
+### Inspect Intermediate Output
+
+Combine stage flags with tracing to see internal state:
+
+```bash
+# See detailed parsing output
+RUST_LOG=mcc_syntax=debug mcc --parse input.c
+
+# See lowering details
+RUST_LOG=mcc=debug mcc --tacky input.c
+
+# See codegen details
+RUST_LOG=mcc=debug mcc --codegen input.c
+```
+
+### Compare Assembly Output
+
+```bash
+# Generate assembly with MCC
+mcc -S myprogram.c
+
+# Compare with GCC output
+gcc -S -o myprogram.gcc.s myprogram.c
+
+# Diff the assembly
+diff myprogram.s myprogram.gcc.s
+```
+
+## Stage Progression
+
+The complete stage pipeline:
+
+```
+Input (.c file)
+    ↓
+[Preprocessing]  → Preprocessed source
+    ↓
+[Lexing]         → Token stream        (--lex stops here)
+    ↓
+[Parsing]        → Abstract Syntax Tree (--parse stops here)
+    ↓
+[Type Checking]  → Validated AST
+    ↓
+[Lowering]       → TACKY IR            (--tacky stops here)
+    ↓
+[Code Gen]       → Assembly IR         (--codegen stops here)
+    ↓
+[Rendering]      → Assembly text (.s)  (-S saves this)
+    ↓
+[Assembling]     → Object file (.o)
+    ↓
+[Linking]        → Executable
+```
+
+## Exit Behavior
+
+When using stage flags:
+
+- **Success:** Exit code 0 if the stage completes without errors
+- **Failure:** Non-zero exit code with diagnostics if the stage fails
+- **No output files:** Stage flags typically don't produce output files (except `-S`)
+
+## Related Commands
+
+- [Basic Compilation](/commands/compile) - Standard compilation workflow
+- [Command Options](/commands/options) - Complete flag reference

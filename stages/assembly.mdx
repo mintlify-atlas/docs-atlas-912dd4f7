@@ -1,0 +1,440 @@
+---
+title: "Assembly Rendering & Linking"
+description: "Assembly IR to text generation and external linking"
+---
+
+The assembly stage renders the assembly IR to AT&T syntax text and invokes an external assembler/linker to produce an executable.
+
+## Overview
+
+This final stage converts abstract assembly instructions into concrete x86-64 assembly text, then delegates to the system toolchain for assembly and linking.
+
+**Input:** `asm::Program<'db>` (assembly IR)  
+**Output:** Executable binary (via external toolchain)  
+**Modules:** `crates/mcc/src/render.rs`, `crates/mcc/src/assembling.rs`
+
+## Rendering Pipeline
+
+### Entry Point
+
+```rust
+#[salsa::tracked]
+pub fn render_program<'db>(db: &'db dyn Db, program: asm::Program<'db>, target: Triple) -> Text {
+    let mut output = String::new();
+    let mut renderer = AssemblyRenderer::new(target, &mut output);
+    renderer.program(db, program).expect("formatting should never fail");
+    output.into()
+}
+```
+
+The `target` parameter (from `target-lexicon`) controls platform-specific syntax.
+
+### Assembly Renderer
+
+```rust
+struct AssemblyRenderer<W> {
+    target: Triple,
+    writer: W,
+}
+```
+
+The renderer walks the assembly IR and writes AT&T syntax to the writer.
+
+## Program Structure
+
+```rust
+fn program(&mut self, db: &dyn Db, program: asm::Program) -> fmt::Result {
+    for function in program.functions(db) {
+        self.render_function(db, function)?;
+        writeln!(self.writer)?;
+    }
+    
+    // Platform-specific epilogue
+    if self.target.operating_system == OperatingSystem::Linux {
+        writeln!(self.writer, ".section .note.GNU-stack, \"\", @progbits")?;
+    }
+    
+    Ok(())
+}
+```
+
+**Linux:** Adds `.note.GNU-stack` section for executable stack marking.
+
+## Function Rendering
+
+### Function Prologue
+
+```rust
+fn render_function(&mut self, db: &dyn Db, function: asm::FunctionDefinition) -> fmt::Result {
+    let name = function.name(db);
+    let name = self.function_name(&name);  // Platform-specific name mangling
+    
+    writeln!(self.writer, ".globl {name}")?;     // Export symbol
+    writeln!(self.writer, "{name}:")?;           // Label
+    writeln!(self.writer, "pushq %rbp")?;        // Save old base pointer
+    writeln!(self.writer, "movq %rsp, %rbp")?;   // Set up new frame
+    
+    for instruction in function.instructions(db) {
+        write!(self.writer, "  ")?;  // Indent instructions
+        self.render_instruction(instruction)?;
+    }
+    
+    Ok(())
+}
+```
+
+**Name mangling:**
+- **macOS/Darwin:** Prefix with `_` (e.g., `_main`)
+- **Linux:** No prefix (e.g., `main`)
+
+```rust
+fn function_name<'a>(&self, name: &'a str) -> Cow<'a, str> {
+    if matches!(
+        self.target.operating_system,
+        OperatingSystem::MacOSX(_) | OperatingSystem::Darwin(_)
+    ) {
+        format!("_{name}").into()
+    } else {
+        name.into()
+    }
+}
+```
+
+## Instruction Rendering
+
+### Stack Allocation
+
+```rust
+asm::Instruction::AllocateStack(size) => {
+    writeln!(self.writer, "subq ${size}, %rsp")?;
+}
+```
+
+Reserves stack space by decrementing the stack pointer.
+
+### Moves
+
+```rust
+asm::Instruction::Mov { src, dst } => {
+    write!(self.writer, "movl ")?;
+    self.operand(src)?;
+    write!(self.writer, ", ")?;
+    self.operand(dst)?;
+    writeln!(self.writer)?;
+}
+```
+
+Emits `movl` (32-bit move) in AT&T syntax: `movl source, destination`.
+
+### Unary Operations
+
+**Negation:**
+```rust
+asm::Instruction::Unary { op: asm::UnaryOperator::Neg, operand } => {
+    write!(self.writer, "negl ")?;
+    self.operand(operand)?;
+    writeln!(self.writer)?;
+}
+```
+
+**Bitwise Complement:**
+```rust
+asm::Instruction::Unary { op: asm::UnaryOperator::Complement, operand } => {
+    write!(self.writer, "notl ")?;
+    self.operand(operand)?;
+    writeln!(self.writer)?;
+}
+```
+
+**Logical NOT:**
+```rust
+asm::Instruction::Unary { op: asm::UnaryOperator::Not, operand } => {
+    // Compare with 0
+    write!(self.writer, "cmpl $0, ")?;
+    self.operand(operand)?;
+    writeln!(self.writer)?;
+    
+    // Set AL to 1 if zero (sete), 0 otherwise
+    write!(self.writer, "sete %al")?;
+    writeln!(self.writer)?;
+    
+    // Move result to operand
+    write!(self.writer, "movb %al, ")?;
+    self.operand(operand)?;
+    writeln!(self.writer)?;
+}
+```
+
+Logical NOT uses comparison + conditional set:
+1. `cmpl $0, operand` – Compare with zero
+2. `sete %al` – Set AL to 1 if zero flag is set
+3. `movb %al, operand` – Copy byte to operand
+
+### Binary Operations
+
+```rust
+asm::Instruction::Binary { op, src, dst } => {
+    self.binary_operator(op)?;  // e.g., "addl", "imull"
+    write!(self.writer, " ")?;
+    self.operand(src)?;
+    write!(self.writer, ", ")?;
+    self.operand(dst)?;
+    writeln!(self.writer)?;
+}
+```
+
+**Operator mapping:**
+```rust
+fn binary_operator(&mut self, op: asm::BinaryOperator) -> fmt::Result {
+    match op {
+        asm::BinaryOperator::Add => write!(self.writer, "addl"),
+        asm::BinaryOperator::Sub => write!(self.writer, "subl"),
+        asm::BinaryOperator::Mul => write!(self.writer, "imull"),
+        asm::BinaryOperator::And => write!(self.writer, "andl"),
+        asm::BinaryOperator::Or => write!(self.writer, "orl"),
+        asm::BinaryOperator::LeftShift => write!(self.writer, "shll"),
+        asm::BinaryOperator::RightShift => write!(self.writer, "shrl"),
+    }
+}
+```
+
+### Division
+
+```rust
+asm::Instruction::Idiv { src } => {
+    write!(self.writer, "idivl ")?;
+    self.operand(src)?;
+    writeln!(self.writer)?;
+}
+
+asm::Instruction::Cdq => {
+    writeln!(self.writer, "cdq")?;
+}
+```
+
+- `cdq` – Sign-extend `%eax` into `%edx:%eax`
+- `idivl` – Signed divide `%edx:%eax` by operand
+
+### Comparisons
+
+```rust
+asm::Instruction::Comparison { op, left, right, dst } => {
+    // Handle memory-to-memory by loading left into register
+    let (left_reg, right_reg) = match (left, right) {
+        (asm::Operand::Stack(_), asm::Operand::Stack(_)) => {
+            write!(self.writer, "movl ")?;
+            self.operand(left)?;
+            write!(self.writer, ", %eax")?;
+            writeln!(self.writer)?;
+            (asm::Operand::Register(asm::Register::AX), right)
+        }
+        (left, right) => (left, right),
+    };
+    
+    // cmpl: compare right with left (AT&T order)
+    write!(self.writer, "cmpl ")?;
+    self.operand(right_reg)?;
+    write!(self.writer, ", ")?;
+    self.operand(left_reg)?;
+    writeln!(self.writer)?;
+    
+    // setcc: set result based on flags
+    write!(self.writer, "set")?;
+    match op {
+        asm::ComparisonOperator::Equal => write!(self.writer, "e")?,
+        asm::ComparisonOperator::NotEqual => write!(self.writer, "ne")?,
+        asm::ComparisonOperator::LessThan => write!(self.writer, "l")?,
+        asm::ComparisonOperator::LessThanOrEqual => write!(self.writer, "le")?,
+        asm::ComparisonOperator::GreaterThan => write!(self.writer, "g")?,
+        asm::ComparisonOperator::GreaterThanOrEqual => write!(self.writer, "ge")?,
+    }
+    write!(self.writer, " %al")?;
+    writeln!(self.writer)?;
+    
+    // Zero-extend byte to 32-bit
+    write!(self.writer, "movzbl %al, %eax")?;
+    writeln!(self.writer)?;
+    
+    // Store result
+    write!(self.writer, "movl %eax, ")?;
+    self.operand(dst)?;
+    writeln!(self.writer)?;
+}
+```
+
+**Comparison sequence:**
+1. `cmpl right, left` – Set flags based on `left - right`
+2. `setcc %al` – Set AL to 0 or 1 based on condition
+3. `movzbl %al, %eax` – Zero-extend to 32 bits
+4. `movl %eax, dst` – Store result
+
+### Control Flow
+
+**Labels:**
+```rust
+asm::Instruction::Label(text) => {
+    writeln!(self.writer, "{text}:")?;
+}
+```
+
+**Unconditional Jump:**
+```rust
+asm::Instruction::Jump { target } => {
+    writeln!(self.writer, "jmp {target}")?;
+}
+```
+
+**Conditional Jumps:**
+```rust
+asm::Instruction::JumpIfZero { condition, target } => {
+    match condition {
+        asm::Operand::Stack(_) => {
+            // Load stack value into register first
+            write!(self.writer, "movl ")?;
+            self.operand(condition)?;
+            write!(self.writer, ", %eax")?;
+            writeln!(self.writer)?;
+            write!(self.writer, "testl %eax, %eax")?;
+            writeln!(self.writer)?;
+        }
+        _ => {
+            write!(self.writer, "testl ")?;
+            self.operand(condition)?;
+            write!(self.writer, ", ")?;
+            self.operand(condition)?;
+            writeln!(self.writer)?;
+        }
+    }
+    write!(self.writer, "jz {target}")?;
+    writeln!(self.writer)?;
+}
+```
+
+- `testl` performs bitwise AND and sets flags (without storing result)
+- `jz` / `jnz` jump based on zero flag
+
+### Return
+
+```rust
+asm::Instruction::Ret => {
+    writeln!(self.writer, "movq %rbp, %rsp")?;   // Restore stack pointer
+    writeln!(self.writer, "popq %rbp")?;         // Restore base pointer
+    writeln!(self.writer, "ret")?;               // Return
+}
+```
+
+Function epilogue: tear down stack frame and return.
+
+## Operand Formatting
+
+```rust
+fn operand(&mut self, operand: asm::Operand) -> fmt::Result {
+    match operand {
+        asm::Operand::Imm(imm) => write!(self.writer, "${imm}"),
+        asm::Operand::Register(reg) => self.register(reg),
+        asm::Operand::Stack(stack) => write!(self.writer, "-{}(%rbp)", stack + 4),
+    }
+}
+
+fn register(&mut self, reg: asm::Register) -> fmt::Result {
+    match reg {
+        asm::Register::AX => write!(self.writer, "%eax"),
+        asm::Register::DX => write!(self.writer, "%edx"),
+        asm::Register::R10 => write!(self.writer, "%r10d"),
+    }
+}
+```
+
+**AT&T Syntax:**
+- Immediates: `$42`
+- Registers: `%eax`
+- Memory: `-8(%rbp)` (offset from base pointer)
+
+## Assembly and Linking
+
+Defined in `assembling.rs`:
+
+```rust
+#[salsa::tracked]
+pub fn assemble_and_link(
+    _db: &dyn Db,
+    cc: OsString,
+    assembly: PathBuf,
+    dest: PathBuf,
+    target: Triple,
+) -> Result<(), CommandError> {
+    let mut cmd = Command::new(cc);
+    cmd.arg("-o").arg(dest);
+    
+    // Cross-compile on macOS if needed
+    if matches!(target.operating_system, OperatingSystem::Darwin(_))
+        && !matches!(target.architecture, Architecture::Aarch64(_))
+    {
+        cmd.arg("-arch").arg(target.architecture.to_string());
+    }
+    
+    cmd.arg(assembly);
+    crate::cmd::run_cmd(&mut cmd)?;
+    
+    Ok(())
+}
+```
+
+Invokes the C compiler as an assembler/linker:
+- Input: Assembly `.s` file
+- Output: Executable binary
+
+**macOS cross-compilation:** Uses `-arch` flag to target x86-64 on ARM Macs.
+
+## Example
+
+**Assembly IR Input:**
+```rust
+FunctionDefinition {
+    name: "main",
+    instructions: [
+        AllocateStack(4),
+        Mov { src: Imm(42), dst: Stack(0) },
+        Mov { src: Stack(0), dst: Register(AX) },
+        Ret,
+    ],
+}
+```
+
+**Rendered Assembly (Linux):**
+```asm
+.globl main
+main:
+pushq %rbp
+movq %rsp, %rbp
+  subq $4, %rsp
+  movl $42, -4(%rbp)
+  movl -4(%rbp), %eax
+  movq %rbp, %rsp
+  popq %rbp
+  ret
+
+.section .note.GNU-stack, "", @progbits
+```
+
+**Rendered Assembly (macOS):**
+```asm
+.globl _main
+_main:
+pushq %rbp
+movq %rsp, %rbp
+  subq $4, %rsp
+  movl $42, -4(%rbp)
+  movl -4(%rbp), %eax
+  movq %rbp, %rsp
+  popq %rbp
+  ret
+```
+
+Note the `_main` prefix on macOS.
+
+## Related Stages
+
+- **Previous:** [Code Generation](/stages/codegen) – Produces assembly IR
+- **External Tools:** `gcc`/`clang` for assembling and linking
+- **Output:** Native executable for target platform

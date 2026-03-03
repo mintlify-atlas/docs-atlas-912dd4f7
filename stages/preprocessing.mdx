@@ -1,0 +1,106 @@
+---
+title: "Preprocessing"
+description: "External C preprocessor invocation via cc -E -P"
+---
+
+The preprocessing stage invokes an external C preprocessor (typically `gcc` or `clang`) to expand macros, include headers, and process directives.
+
+## Overview
+
+MCC delegates preprocessing to the system C compiler rather than implementing its own preprocessor. This stage transforms source files with preprocessor directives into plain C code ready for parsing.
+
+**Input:** `SourceFile` (raw C source code)  
+**Output:** `Text` (preprocessed C code)  
+**Module:** `crates/mcc/src/preprocessing.rs`
+
+## Entry Point
+
+```rust
+#[salsa::tracked]
+pub fn preprocess(db: &dyn Db, cc: OsString, src: SourceFile) -> Result<Text, PreprocessorError>
+```
+
+This Salsa-tracked function invokes the external preprocessor and returns the preprocessed text or an error.
+
+## Implementation Details
+
+### External Command
+
+The preprocessor is invoked via `std::process::Command` with specific flags:
+
+```rust
+let mut cmd = Command::new(&cc);
+cmd.arg("-E")    // Run preprocessor only
+    .arg("-P")    // Omit line markers
+    .arg(path.as_str())
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+```
+
+**Flags:**
+- `-E`: Stop after preprocessing (don't compile)
+- `-P`: Omit linemarker annotations (cleaner output for parsing)
+
+### Error Handling
+
+Two types of errors are caught:
+
+1. **Failed to start:** The compiler executable is missing or unexecutable
+2. **Non-zero exit:** The preprocessor encountered errors (syntax, missing files, etc.)
+
+```rust
+pub struct PreprocessorError {
+    pub cc: OsString,       // Compiler command that failed
+    pub path: PathBuf,      // Source file path
+    pub message: Text,      // Error output from stderr
+}
+```
+
+### Output
+
+On success, stdout is decoded as UTF-8 and wrapped in a `Text` type:
+
+```rust
+Ok(Text::from(String::from_utf8_lossy(&output.stdout)))
+```
+
+## Design Rationale
+
+**Why external preprocessing?**
+
+- Reuses robust, battle-tested preprocessor implementations
+- Avoids reimplementing complex macro expansion and conditional compilation
+- Ensures compatibility with existing C codebases
+- Simplifies MCC's architecture by focusing on compilation stages
+
+**Trade-offs:**
+
+- Requires system C compiler installation
+- Adds process invocation overhead
+- Diagnostic quality depends on external tool
+
+## Example
+
+**Input (main.c):**
+```c
+#define RETURN_CODE 42
+
+int main(void) {
+    return RETURN_CODE;
+}
+```
+
+**After preprocessing:**
+```c
+int main(void) {
+    return 42;
+}
+```
+
+Macro `RETURN_CODE` is expanded, and the `#define` directive is removed.
+
+## Related Stages
+
+- **Next:** [Parsing](/stages/parsing) – Converts preprocessed text to AST
+- **Error Recovery:** Preprocessing errors prevent further compilation

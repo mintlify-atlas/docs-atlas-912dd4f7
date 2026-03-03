@@ -1,0 +1,301 @@
+---
+title: "Typechecking"
+description: "HIR construction and semantic validation"
+---
+
+The typechecking stage validates C semantics and constructs the High-Level Intermediate Representation (HIR), a simplified view of the program suitable for lowering.
+
+## Overview
+
+Typechecking walks the AST to validate semantic rules, then builds an HIR that strips away syntactic details while preserving program structure and types.
+
+**Input:** `SourceFile` (triggers parse internally)  
+**Output:** `hir::TranslationUnit<'db>` (validated HIR)  
+**Modules:** `crates/mcc/src/typechecking/mod.rs`, `crates/mcc/src/typechecking/hir.rs`
+
+## Entry Point
+
+```rust
+#[salsa::tracked]
+pub fn typecheck<'db>(db: &'db dyn Db, file: SourceFile) -> hir::TranslationUnit<'db>
+```
+
+This function runs semantic checks and emits diagnostics via Salsa's accumulator pattern. The HIR is always returned, even if errors occurred.
+
+## HIR Types
+
+The HIR is defined in `typechecking/hir.rs`:
+
+### Translation Unit
+
+```rust
+#[salsa::tracked(debug)]
+pub struct TranslationUnit<'db> {
+    pub items: Vec<Item<'db>>,  // Top-level items (functions, etc.)
+    pub file: SourceFile,
+}
+
+pub enum Item<'db> {
+    Function(FunctionDefinition<'db>),
+}
+```
+
+### Function Definition
+
+```rust
+#[salsa::tracked(debug)]
+pub struct FunctionDefinition<'db> {
+    pub name: Identifier<'db>,
+    pub node: ptr::FunctionDefinition<'db>,  // Pointer back to AST
+}
+```
+
+Functions are represented minimally – the signature is lazily computed.
+
+### Type System
+
+```rust
+pub enum Type {
+    Void,      // void
+    Int,       // int
+    Error,     // Placeholder for invalid types
+}
+
+pub struct Signature<'db> {
+    pub return_type: Type,
+    pub parameters: Vec<Parameter<'db>>,
+}
+```
+
+Currently supports only `int` and `void`. Other types emit diagnostics and become `Type::Error`.
+
+### Identifiers
+
+```rust
+#[salsa::interned(debug)]
+pub struct Identifier {
+    pub text: Text,
+}
+```
+
+Identifiers are interned for efficient comparison and storage.
+
+## Semantic Checks
+
+Typechecking performs multiple validation passes:
+
+### 1. Keyword as Identifier Check
+
+```rust
+const C_KEYWORDS: &[&str] = &[
+    "auto", "break", "case", "char", "const", "continue", "default", "do",
+    "double", "else", "enum", "extern", "float", "for", "goto", "if",
+    "int", "long", "register", "return", "short", "signed", "sizeof",
+    "static", "struct", "switch", "typedef", "union", "unsigned", "void",
+    "volatile", "while",
+];
+```
+
+Ensures keywords like `return` aren't used as variable names:
+
+```rust
+fn ensure_no_keyword_as_identifier(db: &dyn Db, file: SourceFile, root: TsNode, src: &str) {
+    let query = tree_sitter::Query::new(&lang, "(identifier) @id").unwrap();
+    // Check each identifier against keyword list
+    if C_KEYWORDS.contains(&text) {
+        Diagnostic::error()
+            .with_message(format!(
+                "\"{text}\" is a keyword and cannot be used as an identifier"
+            ))
+            .with_code(codes::type_check::keyword_as_identifier)
+            .accumulate(db);
+    }
+}
+```
+
+**Note:** Only identifiers used as names are checked, not type-only identifiers like `void` in `main(void)`.
+
+### 2. Return Type Validation
+
+```rust
+#[salsa::tracked]
+fn function_signature<'db>(
+    db: &'db dyn Db,
+    f: hir::FunctionDefinition<'db>,
+) -> hir::Signature<'db>
+```
+
+Validates that functions have explicit return types:
+
+```rust
+let return_type = match raw.child_by_field_name("type") {
+    None => {
+        Diagnostic::error()
+            .with_message("Expected a return type for function")
+            .with_code(codes::type_check::missing_return_type)
+            .accumulate(db);
+        hir::Type::Error
+    },
+    Some(spec) => {
+        // Parse type specifier
+        match text {
+            "int" => hir::Type::Int,
+            "void" => hir::Type::Void,
+            _ => {
+                Diagnostic::error()
+                    .with_message(format!("invalid type \"{text}\""))
+                    .with_code(codes::type_check::invalid_type)
+                    .accumulate(db);
+                hir::Type::Error
+            }
+        }
+    }
+};
+```
+
+**Old-style definitions** (e.g., `main(void) { ... }`) are rejected.
+
+### 3. Type Specifier Validation
+
+For declarations in function bodies:
+
+```rust
+fn ensure_valid_declaration_types<'db>(
+    db: &'db dyn Db,
+    file: SourceFile,
+    body: ast::CompoundStatement<'db>,
+) {
+    for child in body.children(&mut cursor) {
+        if let Some(decl) = child.as_declaration() {
+            if let Some(type_spec) = raw.child_by_field_name("type") {
+                if type_spec.kind() == "type_identifier" {
+                    // Invalid: e.g., "ints a = 5;"
+                    Diagnostic::error()
+                        .with_message(format!("invalid type \"{text}\""))
+                        .with_code(codes::type_check::invalid_type)
+                        .accumulate(db);
+                }
+            }
+        }
+    }
+}
+```
+
+This catches typos like `ints` instead of `int`.
+
+## Type Context (TyCtx)
+
+For scoped name resolution:
+
+```rust
+#[salsa::tracked(debug)]
+pub struct TyCtx<'db> {
+    pub defs: Vec<hir::Def<'db>>,       // Definitions in this scope
+    pub parent: Option<TyCtx<'db>>,     // Parent scope
+}
+
+pub enum Def<'db> {
+    Function(FunctionDefinition<'db>),
+    Parameter(Parameter<'db>),
+}
+```
+
+Each scope tracks its definitions. Lookup walks parent scopes:
+
+```rust
+impl TyCtx {
+    pub fn lookup(self, db: &dyn Db, name: hir::Identifier<'db>) -> Option<hir::Def<'db>> {
+        let names = self.names(db);
+        names.get(&name).copied()
+    }
+
+    pub fn names(&self, db: &dyn Db) -> im::OrdMap<hir::Identifier<'db>, hir::Def<'db>> {
+        let mut names = self.parent(db).map(|p| p.names(db)).unwrap_or_default();
+        for &def in self.defs(db) {
+            names.insert(def.name(db), def);
+        }
+        names
+    }
+}
+```
+
+## HIR Construction
+
+For each function definition in the AST:
+
+```rust
+fn function_definition<'db>(
+    db: &'db dyn Db,
+    file: SourceFile,
+    f: ast::FunctionDefinition<'db>,
+) -> Option<hir::FunctionDefinition<'db>> {
+    let signature: ast::FunctionDeclarator<'db> = f.declarator().ok()?.as_function_declarator()?;
+    let ident: ast::Identifier<'db> = signature.declarator().ok()?.as_identifier()?;
+
+    let name = hir::Identifier::from_node(db, file, ident);
+    let ptr = ptr::FunctionDefinition::from_node(db, file, f);
+
+    Some(hir::FunctionDefinition::new(db, name, ptr))
+}
+```
+
+The HIR stores:
+- Function name (interned identifier)
+- Pointer back to AST node (for spans and lowering)
+
+Signature computation is deferred to a separate tracked function.
+
+## Example
+
+**Valid Program:**
+```c
+int main(void) {
+    int x = 42;
+    return x;
+}
+```
+
+**HIR:**
+```rust
+TranslationUnit {
+    items: [
+        Function(FunctionDefinition {
+            name: Identifier("main"),
+            node: ptr::FunctionDefinition { ... },
+        })
+    ],
+    file: SourceFile { ... },
+}
+```
+
+**Signature (lazily computed):**
+```rust
+Signature {
+    return_type: Type::Int,
+    parameters: [],
+}
+```
+
+**Invalid Program:**
+```c
+int main(void) {
+    int return = 5;  // Error: keyword as identifier
+    return return;
+}
+```
+
+**Diagnostic:**
+```
+error: "return" is a keyword and cannot be used as an identifier
+  ┌─ main.c:2:9
+  │
+2 │     int return = 5;
+  │         ^^^^^^ keyword used as identifier
+```
+
+## Related Stages
+
+- **Previous:** [Parsing](/stages/parsing) – Produces AST input
+- **Next:** [Lowering](/stages/lowering) – Converts HIR to TAC
+- **HIR Definition:** `crates/mcc/src/typechecking/hir.rs`
+- **Type Context:** Used for scoped name resolution

@@ -1,0 +1,173 @@
+---
+title: "mcc compile"
+description: "Compile C source files to executable binaries"
+---
+
+## Overview
+
+The `mcc` command compiles C source files through a complete compilation pipeline: preprocessing, parsing, lowering to Three Address Code (TACKY), code generation, and assembly/linking.
+
+## Basic Usage
+
+```bash
+mcc [OPTIONS] <INPUT>
+```
+
+### Arguments
+
+<ParamField path="INPUT" type="path" required>
+  The C source file to compile
+</ParamField>
+
+### Options
+
+<ParamField path="--output" type="path">
+  The output file path for the compiled binary. If not specified, defaults to the input filename without extension.
+  
+  **Short form:** `-o`
+  
+  **Example:**
+  ```bash
+  mcc -o myprogram main.c
+  ```
+</ParamField>
+
+<ParamField path="--target" type="triple">
+  The target triple for cross-compilation (e.g., `x86_64-unknown-linux-gnu`). Defaults to the host system's target.
+  
+  **Default:** Host system target
+  
+  **Example:**
+  ```bash
+  mcc --target x86_64-unknown-linux-gnu main.c
+  ```
+</ParamField>
+
+<ParamField path="--color" type="choice">
+  Control colored output for diagnostics.
+  
+  **Choices:** `auto`, `always`, `never`
+  
+  **Default:** `auto`
+  
+  **Example:**
+  ```bash
+  mcc --color always main.c
+  ```
+</ParamField>
+
+## Examples
+
+### Compile a Simple Program
+
+```bash
+mcc hello.c
+```
+
+This compiles `hello.c` and produces an executable named `hello` in the current directory.
+
+**Input:** `hello.c`
+```c
+int main(void) {
+    return 42;
+}
+```
+
+**Output:**
+```bash
+$ mcc hello.c
+$ ./hello
+$ echo $?
+42
+```
+
+### Specify Output File
+
+```bash
+mcc -o myprogram main.c
+```
+
+Compiles `main.c` and writes the executable to `myprogram`.
+
+### Cross-Compilation
+
+```bash
+mcc --target x86_64-unknown-linux-gnu main.c
+```
+
+Compiles for a specific target architecture.
+
+### Disable Colored Output
+
+```bash
+mcc --color never main.c
+```
+
+Useful for CI/CD pipelines or when redirecting output to files.
+
+## Compilation Pipeline
+
+The `mcc` compiler executes the following stages:
+
+1. **Preprocessing** - Expands macros and includes (delegates to system C preprocessor)
+2. **Lexing** - Tokenizes the preprocessed source
+3. **Parsing** - Builds an Abstract Syntax Tree (AST)
+4. **Validation** - Type checking and semantic analysis
+5. **Lowering** - Converts AST to Three Address Code (TACKY IR)
+6. **Code Generation** - Generates assembly instructions
+7. **Assembly** - Produces object files and links into executable
+
+You can stop at any stage using the stage-specific flags. See [Stage Control](/commands/stages) for details.
+
+## Diagnostics
+
+The compiler emits diagnostics with severity levels:
+
+- **Error** - Compilation cannot continue
+- **Warning** - Potential issues that don't prevent compilation
+- **Note** - Additional context for other diagnostics
+
+Diagnostics include source location information with line numbers and column markers:
+
+```bash
+$ mcc invalid.c
+error: expected ';' after return statement
+  --> invalid.c:2:5
+   |
+ 2 |     return 42
+   |              ^ expected ';'
+```
+
+## Exit Codes
+
+- **0** - Compilation succeeded
+- **Non-zero** - Compilation failed (syntax error, type error, or system error)
+
+## Environment Variables
+
+<ParamField path="CC" type="string">
+  The C compiler to use for preprocessing and linking. Defaults to `cc`.
+  
+  **Default:** `cc`
+  
+  **Example:**
+  ```bash
+  CC=gcc mcc main.c
+  ```
+</ParamField>
+
+<ParamField path="RUST_LOG" type="string">
+  Controls tracing output for debugging the compiler itself.
+  
+  **Default:** `warn,mcc=debug,mcc-syntax=debug,mcc-driver=debug`
+  
+  **Example:**
+  ```bash
+  RUST_LOG=trace mcc main.c
+  ```
+</ParamField>
+
+## Related Commands
+
+- [Stage Control](/commands/stages) - Stop compilation at specific stages
+- [Command Options](/commands/options) - Complete reference of all flags

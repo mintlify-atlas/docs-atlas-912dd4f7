@@ -1,0 +1,279 @@
+---
+title: Architecture
+description: Learn about MCC's crate structure, module boundaries, and architectural invariants
+---
+
+MCC is organized into distinct crates with clear separation of concerns. This page explains the overall architecture, crate boundaries, and key design principles.
+
+## Crate structure
+
+The project is split into several crates, each with a specific responsibility:
+
+<CardGroup cols={2}>
+  <Card title="mcc" icon="gear">
+    Core compiler library containing the full compilation pipeline
+  </Card>
+  <Card title="mcc-syntax" icon="code">
+    Tree-sitter integration and strongly-typed AST nodes
+  </Card>
+  <Card title="mcc-driver" icon="terminal">
+    Command-line interface and orchestration
+  </Card>
+  <Card title="xtask" icon="wrench">
+    Build-time tooling and development utilities
+  </Card>
+</CardGroup>
+
+### Core compiler (`mcc`)
+
+The `mcc` crate implements all compilation logic as separate modules:
+
+```rust
+// From crates/mcc/src/lib.rs
+pub use crate::{
+    assembling::assemble_and_link,
+    codegen::generate_assembly,
+    lowering::{lower, lower_program},
+    parsing::parse,
+    preprocessing::preprocess,
+    render::render_program,
+};
+```
+
+Each stage is exposed through tracked functions that enable incremental compilation via Salsa.
+
+### Syntax layer (`mcc-syntax`)
+
+Provides strongly-typed AST nodes generated from the tree-sitter C grammar. This layer is independent of compilation logic and focuses purely on syntax representation.
+
+```toml
+# Key dependency
+type-sitter = "0.13.2"
+```
+
+The syntax layer wraps tree-sitter nodes with type-safe accessors, making AST traversal safer and more ergonomic.
+
+### Driver (`mcc-driver`)
+
+Orchestrates the compilation pipeline and handles user interaction. The driver exposes a `Callbacks` trait fired after each stage:
+
+- `after_parse`
+- `after_lower`
+- `after_codegen`
+- `after_render_assembly`
+- `after_compile`
+
+This allows tools and tests to inspect intermediate representations without modifying the core compiler.
+
+## Module boundaries
+
+MCC enforces strict boundaries between layers to maintain clarity and enable incremental compilation.
+
+### Syntax/compilation boundary
+
+The `mcc-syntax` crate provides the AST interface, while `mcc` contains all compilation logic. This ensures syntax changes don't require recompiling the entire compiler.
+
+<Note>
+  The syntax layer contains **no compilation logic**. It only provides strongly-typed wrappers around tree-sitter nodes.
+</Note>
+
+### Pipeline stage boundaries
+
+Each compilation stage is implemented as a separate module with clear input/output contracts:
+
+```rust
+// crates/mcc/src/lib.rs:23
+#[salsa::tracked]
+pub fn parse(db: &dyn Db, file: SourceFile) -> Ast<'_>
+
+// crates/mcc/src/typechecking/mod.rs:23
+#[salsa::tracked]
+pub fn typecheck(db: &dyn Db, file: SourceFile) -> hir::TranslationUnit<'_>
+
+// crates/mcc/src/lowering/mod.rs:716
+#[salsa::tracked]
+pub fn lower_program(db: &dyn Db, file: SourceFile) -> tacky::Program<'_>
+
+// crates/mcc/src/codegen/mod.rs:10
+#[salsa::tracked]
+pub fn generate_assembly(db: &dyn Db, program: tacky::Program<'_>) -> asm::Program<'_>
+```
+
+Stages communicate only through well-defined data structures. No stage depends on later stages in the pipeline.
+
+### External tool boundary
+
+The compiler delegates preprocessing, assembly, and linking to external tools (typically the system C compiler):
+
+```rust
+// crates/mcc/src/preprocessing.rs:12
+#[salsa::tracked]
+pub fn preprocess(db: &dyn Db, cc: OsString, src: SourceFile) 
+    -> Result<Text, PreprocessorError>
+
+// crates/mcc/src/assembling.rs:10
+#[salsa::tracked]
+pub fn assemble_and_link(
+    _db: &dyn Db,
+    cc: OsString,
+    assembly: PathBuf,
+    dest: PathBuf,
+    target: Triple,
+) -> Result<(), CommandError>
+```
+
+This allows the compiler to focus on core compilation logic while leveraging mature external tools.
+
+## Key types and abstractions
+
+The compiler uses well-defined types to represent data at each stage:
+
+<Accordion title="SourceFile">
+  Represents a source file with path and contents. Created as a Salsa input.
+  
+  ```rust
+  let file = SourceFile::new(&db, Text::from("main.c"), Text::from(src));
+  ```
+</Accordion>
+
+<Accordion title="Ast">
+  Wraps the tree-sitter parse tree with strongly-typed accessors from `mcc-syntax`.
+  
+  ```rust
+  let ast = parse(&db, file);
+  let root = ast.root(&db); // TranslationUnit<'db>
+  ```
+</Accordion>
+
+<Accordion title="hir::TranslationUnit">
+  High-Level IR produced by typechecking. A simplified, semantically-checked AST.
+  
+  ```rust
+  // crates/mcc/src/typechecking/hir.rs:14
+  #[salsa::tracked(debug)]
+  pub struct TranslationUnit<'db> {
+      pub items: Vec<Item<'db>>,
+      pub file: SourceFile,
+  }
+  ```
+</Accordion>
+
+<Accordion title="tacky::Program">
+  Three Address Code (TAC) intermediate representation.
+  
+  ```rust
+  let tacky = lower_program(&db, file);
+  ```
+</Accordion>
+
+<Accordion title="asm::Program">
+  Assembly IR prior to textual rendering. Target-agnostic representation.
+  
+  ```rust
+  let asm_ir = generate_assembly(&db, tacky);
+  ```
+</Accordion>
+
+<Accordion title="Database / Db trait">
+  Salsa database for incremental compilation. All tracked functions take `&dyn Db`.
+  
+  ```rust
+  #[salsa::db]
+  pub trait Db: salsa::Database {}
+  
+  #[salsa::db]
+  #[derive(Default, Clone)]
+  pub struct Database {
+      storage: salsa::Storage<Self>,
+  }
+  ```
+</Accordion>
+
+<Accordion title="Diagnostics">
+  Salsa accumulator for collecting `codespan-reporting` diagnostics. Stages push diagnostics instead of failing.
+  
+  ```rust
+  Diagnostic::error()
+      .with_message("invalid type")
+      .with_code(codes::type_check::invalid_type)
+      .accumulate(db);
+  ```
+</Accordion>
+
+<Accordion title="Text">
+  Reference-counted string type for efficient memory sharing (wrapper around `Arc<str>`).
+</Accordion>
+
+## Architectural invariants
+
+These rules are enforced throughout the codebase:
+
+<Check>No compilation stage depends on later stages in the pipeline</Check>
+<Check>The syntax layer contains no compilation logic</Check>
+<Check>All compilation stages are implemented as pure functions with Salsa tracking</Check>
+<Check>Error handling is non-fatal - compilation continues to collect all errors</Check>
+<Check>The driver crate contains no compilation logic, only orchestration</Check>
+
+### Error handling boundary
+
+All compilation stages accumulate diagnostics rather than failing immediately:
+
+```rust
+// crates/mcc/src/lowering/mod.rs:700
+pub fn lower_stage_diagnostics(
+    db: &dyn Db,
+    file: SourceFile,
+) -> Vec<&crate::diagnostics::Diagnostics> {
+    let typecheck_diags = 
+        crate::typechecking::typecheck::accumulated::<Diagnostics>(db, file);
+    let lower_diags = 
+        lower_program::accumulated::<Diagnostics>(db, file);
+    typecheck_diags.into_iter().chain(lower_diags).collect()
+}
+```
+
+This allows the compiler to report all errors in a single pass.
+
+## Target support
+
+The compiler targets x86_64 by default but uses `target-lexicon` for architecture abstraction:
+
+```rust
+// crates/mcc/src/lib.rs:134
+pub fn default_target() -> Triple {
+    Triple {
+        architecture: Architecture::X86_64,
+        ..Triple::host()
+    }
+}
+```
+
+The renderer applies OS-specific conventions:
+
+```rust
+// crates/mcc/src/render.rs:46
+fn function_name<'a>(&self, name: &'a str) -> Cow<'a, str> {
+    if matches!(
+        self.target.operating_system,
+        OperatingSystem::MacOSX(_) | OperatingSystem::Darwin(_)
+    ) {
+        format!("_{name}").into()  // Leading underscore on macOS
+    } else {
+        name.into()
+    }
+}
+```
+
+## Dependencies
+
+Key external dependencies:
+
+- **Salsa** (`0.13.2`) - Incremental computation framework
+- **tree-sitter** / **type-sitter** - Parsing with error recovery
+- **codespan-reporting** - Diagnostic rendering
+- **target-lexicon** - Target platform abstraction
+- **im** - Persistent data structures for scopes
+
+<Info>
+  See the [Incremental compilation](/concepts/incremental-compilation) page to learn how Salsa enables fast rebuilds.
+</Info>

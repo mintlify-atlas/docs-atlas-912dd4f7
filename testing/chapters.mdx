@@ -1,0 +1,345 @@
+---
+title: Test Chapter Organization
+description: Understanding the chapter-based progression of compiler features
+---
+
+The integration test suite is organized into 20 chapters that progressively introduce C language features. Each chapter builds on the previous chapters, testing increasingly complex compiler functionality.
+
+## Chapter Progression
+
+Tests are organized in the directory structure:
+
+```
+writing-a-c-compiler-tests/
+└── tests/
+    ├── chapter_1/
+    │   ├── valid/
+    │   ├── invalid_parse/
+    │   └── invalid_semantics/
+    ├── chapter_2/
+    │   ├── valid/
+    │   └── invalid_parse/
+    └── ...
+```
+
+Each chapter directory contains subdirectories for different test categories.
+
+## Test Categories
+
+Tests are organized by expected behavior:
+
+### Valid Tests (`valid/`)
+
+Programs that should:
+- Compile successfully through all stages
+- Execute and return the expected exit code
+- Produce the expected standard output (if specified)
+
+Example test case:
+```c
+// valid/return_2.c
+int main(void) {
+    return 2;
+}
+```
+
+Expected result (from `expected_results.json`):
+```json
+{
+  "chapter_1/valid/return_2.c": {
+    "return_code": 2
+  }
+}
+```
+
+### Invalid Tests
+
+Programs that should fail at specific compilation stages:
+
+- **`invalid_parse/`** - Lexical or syntactic errors
+- **`invalid_tacky/`** - Errors during lowering to intermediate representation
+- **`invalid_semantics/`** - Semantic analysis errors
+- **`invalid_codegen/`** - Code generation errors
+- **`invalid_types/`** - Type checking errors (in later chapters)
+
+The test framework verifies that compilation fails at the expected stage.
+
+## Chapter Overview
+
+### Chapters 1-10: Core Language Features
+
+These chapters introduce fundamental C language constructs:
+
+**Chapter 1: A Minimal Compiler**
+- Basic program structure
+- Return statements
+- Integer literals
+- Tests: Simple programs that return integer constants
+
+**Chapter 2: Unary Operators**
+- Negation (`-`)
+- Bitwise complement (`~`)
+- Logical negation (`!`)
+- Tests: Expressions with unary operators
+
+**Chapter 3: Binary Operators**
+- Addition and subtraction
+- Multiplication and division
+- Modulo
+- Tests: Arithmetic expressions with operator precedence
+
+**Chapter 4: Logical and Relational Operators**
+- Comparison operators (`<`, `>`, `<=`, `>=`, `==`, `!=`)
+- Logical operators (`&&`, `||`)
+- Short-circuit evaluation
+- Tests: Boolean expressions and comparisons
+
+**Chapter 5: Local Variables**
+- Variable declarations
+- Assignment statements
+- Identifier resolution
+- Tests: Programs using local variables
+
+**Chapter 6: Statements**
+- If statements
+- Conditional expressions (ternary operator)
+- Block statements
+- Tests: Control flow with conditionals
+
+**Chapter 7: Compound Assignment**
+- Compound operators (`+=`, `-=`, `*=`, `/=`, `%=`)
+- Tests: Assignment operators with side effects
+
+**Chapter 8: Loops**
+- While loops
+- Do-while loops
+- For loops
+- Break and continue statements
+- Tests: Iterative control flow
+
+**Chapter 9: Functions**
+- Function declarations
+- Function definitions
+- Function calls
+- Parameter passing
+- Tests: Multi-function programs
+
+**Chapter 10: File-Scope Variables and Storage Classes**
+- Global variables
+- Static variables
+- Storage class specifiers
+- Tests: Variable scoping and lifetime
+
+### Chapters 11-18: Advanced Features
+
+These chapters introduce more complex language features:
+
+**Chapter 11: Long Integers**
+- `long` type
+- Type conversions
+- Tests: 64-bit integer arithmetic
+
+**Chapter 12: Unsigned Integers**
+- `unsigned` type specifier
+- Signed/unsigned conversions
+- Tests: Unsigned arithmetic and wrap-around
+
+**Chapter 13: Floating-Point Numbers**
+- `double` type
+- Floating-point arithmetic
+- Type conversions with floating-point
+- Tests: Floating-point expressions
+
+**Chapter 14: Pointers**
+- Pointer types
+- Address-of operator (`&`)
+- Indirection operator (`*`)
+- Tests: Pointer arithmetic and dereferencing
+
+**Chapter 15: Arrays**
+- Array declarations
+- Array subscripting
+- Array/pointer relationship
+- Tests: Array access and manipulation
+
+**Chapter 16: Strings**
+- String literals
+- Character arrays
+- String manipulation
+- Tests: String operations
+
+**Chapter 17: Structs**
+- Structure types
+- Member access (`.` and `->`)
+- Structure assignment
+- Tests: Complex data structures
+
+**Chapter 18: Additional Pointer Types**
+- Function pointers
+- Void pointers
+- Pointer conversions
+- Tests: Advanced pointer usage
+
+### Chapter 19: Optimizations
+
+This chapter introduces compiler optimizations:
+
+- Constant folding
+- Dead code elimination
+- Copy propagation
+- Common subexpression elimination
+
+Tests verify that optimizations:
+- Preserve program semantics
+- Improve code quality
+- Handle edge cases correctly
+
+Compiler must support optimization flags (e.g., `--fold-constants`).
+
+### Chapter 20: Register Allocation
+
+This chapter tests efficient register usage:
+
+- Register allocation strategies
+- Spilling to memory
+- Register coalescing
+
+Tests verify that the compiler:
+- Generates efficient code
+- Handles register pressure
+- Produces correct results with limited registers
+
+## Test Naming Convention
+
+Test names follow the pattern: `chapter_{n}::{kind}::{filename}`
+
+Examples:
+- `chapter_1::valid::return_2`
+- `chapter_3::invalid_parse::malformed_paren`
+- `chapter_5::valid::multiple_vars`
+- `chapter_6::invalid_semantics::undeclared_var`
+
+This naming scheme allows:
+- Easy filtering by chapter: `chapter_3`
+- Easy filtering by kind: `::valid::`
+- Easy filtering by feature: `return`
+
+## Chapter Configuration
+
+The test harness limits which chapters are tested via `MAX_CHAPTER`:
+
+```rust
+// In integration.rs
+const MAX_CHAPTER: u32 = 6;
+```
+
+Tests beyond this limit are marked as ignored:
+
+```rust
+let ignored = test.chapter > MAX_CHAPTER || ignored.contains(&test.name.as_str());
+let trial = test.trial().with_ignored_flag(ignored);
+```
+
+This allows:
+- Progressive development (implement features chapter by chapter)
+- CI to run only completed chapters
+- Development testing of future chapters with `--ignored`
+
+## Feature Dependencies
+
+Later chapters depend on earlier ones:
+
+- **Chapter 5** (variables) requires chapters 1-4 (expressions)
+- **Chapter 6** (conditionals) requires chapter 5 (variables)
+- **Chapter 8** (loops) requires chapter 6 (conditionals)
+- **Chapter 9** (functions) requires chapter 8 (loops)
+- **Chapter 14** (pointers) requires chapters 11-13 (type system)
+
+Tests assume all previous chapter features are implemented.
+
+## Extra Credit Features
+
+Some chapters include optional "extra credit" features:
+
+- **Bitwise operators** (`&`, `|`, `^`, `<<`, `>>`)
+- **Compound assignment** with bitwise operators
+- **Increment/decrement** operators (`++`, `--`)
+- **Goto statements** and labels
+- **Switch statements**
+- **NaN handling** for floating-point
+- **Union types**
+
+The test framework configuration in the README describes how to enable these features:
+
+```rust
+config.extra_credit = ExtraCreditFlags::BITWISE | ExtraCreditFlags::COMPOUND;
+```
+
+MCC implements these features as part of the standard compiler, not as extra credit.
+
+## Expected Results
+
+All test expectations are defined in `expected_results.json`:
+
+```json
+{
+  "chapter_1/valid/return_0.c": {
+    "return_code": 0
+  },
+  "chapter_1/valid/return_2.c": {
+    "return_code": 2
+  },
+  "chapter_3/valid/add.c": {
+    "return_code": 5
+  }
+}
+```
+
+For tests with output:
+
+```json
+{
+  "chapter_16/valid/hello.c": {
+    "return_code": 0,
+    "stdout": "Hello, World!\n"
+  }
+}
+```
+
+The test framework automatically loads and validates against these expectations.
+
+## Running Chapter Tests
+
+### Run a Single Chapter
+
+```bash
+cargo test -p integration-tests --test integration -- chapter_1
+```
+
+### Run Multiple Chapters
+
+```bash
+cargo test -p integration-tests --test integration -- 'chapter_[12]'
+```
+
+### Run Chapters Beyond the Cap
+
+```bash
+# Run all ignored tests (chapters > MAX_CHAPTER)
+cargo test -p integration-tests --test integration -- --ignored
+
+# Run specific ignored chapter
+cargo test -p integration-tests --test integration -- chapter_10 --ignored
+```
+
+### Run Only Valid Tests for a Chapter
+
+```bash
+cargo test -p integration-tests --test integration -- chapter_3::valid
+```
+
+### Run Only Invalid Tests for a Chapter
+
+```bash
+cargo test -p integration-tests --test integration -- chapter_5::invalid
+```
