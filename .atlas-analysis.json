@@ -1,0 +1,99 @@
+{
+  "projectType": "cli-tool",
+  "projectName": "MCC",
+  "projectDescription": "A self-hosting C compiler written in Rust with incremental compilation and comprehensive test coverage.",
+  "theme": "aspen",
+  "primaryColor": "#2563eb",
+  "lightColor": "#3b82f6",
+  "darkColor": "#1e40af",
+  "navigation": {
+    "groups": [
+      {
+        "group": "Get Started",
+        "pages": [
+          "introduction",
+          "installation",
+          "quickstart"
+        ]
+      },
+      {
+        "group": "Core Concepts",
+        "pages": [
+          "concepts/architecture",
+          "concepts/pipeline",
+          "concepts/incremental-compilation"
+        ]
+      },
+      {
+        "group": "Command Reference",
+        "pages": [
+          "commands/compile",
+          "commands/stages",
+          "commands/options"
+        ]
+      },
+      {
+        "group": "Compilation Stages",
+        "pages": [
+          "stages/preprocessing",
+          "stages/parsing",
+          "stages/typechecking",
+          "stages/lowering",
+          "stages/codegen",
+          "stages/assembly"
+        ]
+      },
+      {
+        "group": "API Reference",
+        "pages": [
+          "api/overview",
+          "api/database",
+          "api/diagnostics",
+          "api/callbacks"
+        ]
+      },
+      {
+        "group": "Testing",
+        "pages": [
+          "testing/framework",
+          "testing/integration",
+          "testing/chapters"
+        ]
+      },
+      {
+        "group": "Development",
+        "pages": [
+          "development/contributing",
+          "development/codebase",
+          "development/extending"
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Full C compilation pipeline from preprocessing to assembly",
+    "Incremental compilation with Salsa",
+    "Tree-sitter based parsing with error recovery",
+    "Multiple intermediate representations (HIR, TAC, ASM IR)",
+    "Comprehensive test framework with 20+ test chapters",
+    "Stage-specific compilation stops for debugging",
+    "Detailed diagnostic reporting with codespan",
+    "x86_64 target support with OS-specific conventions"
+  ],
+  "publicApiSurface": [
+    "mcc compile <file>",
+    "mcc --stage <lex|parse|validate|tacky|codegen|run>",
+    "mcc --target <triple>",
+    "mcc --output <path>",
+    "Database::default()",
+    "parse(db, source_file)",
+    "typecheck(db, source_file)",
+    "lower_program(db, source_file)",
+    "generate_assembly(db, tacky_program)",
+    "render_program(db, asm_program, target)",
+    "assemble_and_link(db, asm_text, config)",
+    "Callbacks trait",
+    "Config struct",
+    "TestRunner::new(config)"
+  ]
+}
